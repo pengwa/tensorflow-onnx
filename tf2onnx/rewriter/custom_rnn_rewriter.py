@@ -14,7 +14,7 @@ from onnx import onnx_pb
 import numpy as np
 from tf2onnx.graph import Graph
 from tf2onnx.graph_matcher import OpTypePattern, GraphMatcher
-from tf2onnx.rewriter.loop_rewriter_base import LoopRewriterBase, Context
+from tf2onnx.rewriter.loop_rewriter_base import LoopRewriterBase, Context, TensorArrayProp
 from tf2onnx.rewriter.rnn_utils import is_tensor_array_gather_op, is_tensor_array_write_op
 from tf2onnx.rewriter.rnn_utils import BodyGraphDict, REWRITER_RESULT, SubGraphMetadata
 from tf2onnx.tfonnx import utils
@@ -33,23 +33,15 @@ class CustomRnnContext(Context):
         self.other_loop_vars = {}
         self.rnn_scope = None
 
-        self.output_tas = []
-        self.input_tas = []
         self.time_var = None
         self.iteration_var = None
 
 
-class TensorArrayProp(object):
-    def __init__(self):
-        self.index_input_id = None
-        self.data_input_id = None
-        self.output_id = None
-
-
 class ScanProperties(object):
-    def __init__(self, initial_state_and_scan_inputs, loop_state_inputs,
+    def __init__(self, initial_state_inputs, initial_scan_inputs, loop_state_inputs,
                  loop_state_outputs, loop_scan_inputs, loop_scan_outputs):
-        self.initial_state_and_scan_inputs = initial_state_and_scan_inputs
+        self.initial_state_inputs = initial_state_inputs
+        self.initial_scan_inputs = initial_scan_inputs
         self.loop_state_inputs = loop_state_inputs
         self.loop_state_outputs = loop_state_outputs
         self.loop_scan_inputs = loop_scan_inputs
@@ -59,16 +51,6 @@ class ScanProperties(object):
 class CustomRnnRewriter(LoopRewriterBase):
     def __init__(self, g):
         super(CustomRnnRewriter, self).__init__(g)
-        self.rnn_input_pattern = \
-            OpTypePattern('TensorArrayReadV3', name='ta_read', inputs=[
-                OpTypePattern("Enter", name="ta_enter", inputs=[
-                    OpTypePattern("TensorArrayV3")
-                ]),
-                OpTypePattern('*'),
-                OpTypePattern("Enter", name="ta_scatter_enter", inputs=[
-                    OpTypePattern("TensorArrayScatterV3", name="ta_input_scatter")
-                ]),
-            ])
 
     def create_context(self):
         return CustomRnnContext()
@@ -131,8 +113,6 @@ class CustomRnnRewriter(LoopRewriterBase):
             return False
 
         self._parse_time_var(context)
-        self._parse_output_ta(context)
-        self._parse_input_ta(context)
 
         if not (context.input_tas or context.output_tas):
             log.debug("this should not be a dynamic_rnn loop, no ta input or output are found")
@@ -143,14 +123,18 @@ class CustomRnnRewriter(LoopRewriterBase):
         log.debug("enter rewrite function")
         scan_node = None
         try:
-            to_remove = self._cut_off_connection_for_cell(context)
-            all_nodes = self.g.get_nodes()
-            for n in set(to_remove):
-                if n in all_nodes:
-                    all_nodes.remove(n)
-            self.g.set_nodes(all_nodes)
+            scan_props = context.loop_properties
+            nodes_to_append = []
+            for i, state_input in enumerate(scan_props.initial_state_inputs):
+                nodes = self._adapt_scan_sequence_input_or_output("input", state_input, False)
+                scan_props.initial_state_inputs[i] = nodes[-1].output[0]
+                nodes_to_append.extend(nodes)
 
-            scan_props, nodes_to_append = self._compose_cell_inputs_and_outputs(context)
+            for i, scan_input in enumerate(scan_props.initial_scan_inputs):
+                nodes = self._adapt_scan_sequence_input_or_output("input", scan_input, False)
+                scan_props.initial_scan_inputs[i] = nodes[-1].output[0]
+                nodes_to_append.extend(nodes)
+
             scan_node = self._create_scan_node(context, scan_props)
             if not scan_node:
                 log.error("failed to create scan node during rewrite")
@@ -180,127 +164,15 @@ class CustomRnnRewriter(LoopRewriterBase):
                   time_var.enter_input_id, self.g.get_shape(time_var.enter_input_id),
                   time_var.switch_true_identity_output_id, self.g.get_shape(time_var.switch_true_identity_output_id))
 
-    def _parse_output_ta(self, context):
-        for enter_name, loop_var in context.loop_variables.items():
-            if not loop_var.is_tensor_array:
-                continue
-
-            output_ta = TensorArrayProp()
-            output_ta.data_input_id = loop_var.next_iteration_input_id
-
-            output_ta.index_input_id = loop_var.ta_index_id
-            if loop_var.exit_output_id:
-                exit_consumers = self.g.find_output_consumers(loop_var.exit_output_id)
-                ta_gather_node = [n for n in exit_consumers if is_tensor_array_gather_op(n)][0]
-                output_ta.output_id = ta_gather_node.output[0]
-
-            context.output_tas.append(output_ta)
-            log.debug("output ta %s - data input (%s) shape: %s, output (%s) shape: %s", enter_name,
-                      output_ta.data_input_id, self.g.get_shape(output_ta.data_input_id),
-                      output_ta.output_id, self.g.get_shape(output_ta.output_id))
-
-    def _parse_input_ta(self, context):
-        matcher = GraphMatcher(self.rnn_input_pattern, allow_reorder=True)
-        match_results = list(matcher.match_ops(self.g.get_nodes()))
-        match_results = [r for r in match_results if r.get_op("ta_input_scatter").name.startswith(context.rnn_scope)]
-        for match in match_results:
-            ta_input_scatter = match.get_op("ta_input_scatter")
-            # the 3rd input of scatter is the value
-            input_ta = TensorArrayProp()
-
-            # dynamic_rnn specific approach.
-            input_ta.data_input_id = ta_input_scatter.input[2]
-
-            ta_read_node = match.get_op("ta_read")
-            input_ta.index_input_id = ta_read_node.input[1]
-            input_ta.output_id = match.get_op("ta_read").output[0]
-
-            input_shape = self.g.get_shape(input_ta.data_input_id)
-            output_shape = self.g.get_shape(input_ta.output_id)
-            if output_shape is None and input_shape is not None:
-                self.g.set_shape(input_ta.output_id, input_shape[1:])
-
-            context.input_tas.append(input_ta)
-
-            log.debug("input ta %s - data input (%s) shape: %s, output (%s) shape: %s", ta_read_node.name,
-                      input_ta.data_input_id, self.g.get_shape(input_ta.data_input_id),
-                      input_ta.output_id, self.g.get_shape(input_ta.output_id))
-
-    def _cut_off_connection_for_cell(self, context):
-        nodes_to_remove = []
-        all_vars = [context.time_var]
-        all_vars += [val for _, val in context.other_loop_vars.items()]
-        for val in all_vars:
-            # remove the node to cut off a starting node of the cell (e.g. loop body).
-            nodes_to_remove.append(self.g.get_node_by_output(val.switch_true_identity_output_id))
-
-            # connect NextIteration to an invalid node, to cut off a ending node of the cell.
-            next_iter_nodes = [n for n in self.g.get_nodes() if n.type == "NextIteration"]
-            self.g.replace_all_inputs(next_iter_nodes, val.next_iteration_input_id, INVLAID_INPUT_ID)
-
-        for input_ta in context.input_tas:
-            # remove the node to cut off connection between scan_input and the cell.
-            nodes_to_remove.append(self.g.get_node_by_output(input_ta.output_id))
-
-        for output_ta in context.output_tas:
-            # remove the node to cut off connection between scan_output and the cell.
-            ta_write_nodes = [n for n in self.g.get_nodes() if is_tensor_array_write_op(n)]
-            self.g.replace_all_inputs(ta_write_nodes, output_ta.data_input_id, INVLAID_INPUT_ID)
-
-        return nodes_to_remove
-
-    def _compose_cell_inputs_and_outputs(self, context):
-        log.debug("_compose_cell_inputs_and_outputs")
-
-        nodes_to_append = []
-        loop_state_inputs = []
-        loop_state_outputs = []
-        initial_state_and_scan_inputs = []
-
-        # change time shape to {1} since current Scan does not support
-        time_var, to_append = self._adapt_time_var_as_workaround(context.time_var)
-        nodes_to_append.extend(to_append)
-
-        log.debug("prepare cell state inputs")
-        vars_to_iterate = [time_var] + [val for _, val in context.other_loop_vars.items()]
-        for var in vars_to_iterate:
-            nodes = self._adapt_scan_sequence_input_or_output("input", var.enter_input_id, False)
-            var.enter_input_id = nodes[-1].output[0]
-            nodes_to_append.extend(nodes)
-
-            loop_state_inputs.append(var.switch_true_identity_output_id)
-            loop_state_outputs.append(var.next_iteration_input_id)
-            initial_state_and_scan_inputs.append(var.enter_input_id)
-
-        log.debug("prepare cell scan inputs")
-        loop_scan_inputs = []
-        for input_ta in context.input_tas:
-            nodes = self._adapt_scan_sequence_input_or_output("input_ta", input_ta.data_input_id, False)
-            input_ta.data_input_id = nodes[-1].output[0]
-            nodes_to_append.extend(nodes)
-
-            loop_scan_inputs.append(input_ta.output_id)
-            initial_state_and_scan_inputs.append(input_ta.data_input_id)
-
-        log.debug("prepare cell scan outputs")
-        loop_scan_outputs = []
-        for output_ta in context.output_tas:
-            loop_scan_outputs.append(output_ta.data_input_id)
-
-        scan_props = ScanProperties(initial_state_and_scan_inputs, loop_state_inputs, loop_state_outputs,
-                                    loop_scan_inputs, loop_scan_outputs)
-
-        return scan_props, nodes_to_append
-
     def _create_scan_node(self, context, scan_props):
         log.debug("create scan node")
         # here we did not give the sequence_length, because
         # current batch size is 1, not original batch size
         # original seq_length will be used by the loop body of Scan op.
-        scan_node = self.g.make_node("Scan", [""] + scan_props.initial_state_and_scan_inputs,
+        scan_node = self.g.make_node("Scan", [""] + scan_props.initial_state_inputs + scan_props.initial_scan_inputs,
                                      attr={"num_scan_inputs": len(scan_props.loop_scan_inputs)},
                                      output_count=len(scan_props.loop_state_outputs + scan_props.loop_scan_outputs),
-                                     skip_conversion=True)
+                                     skip_conversion=False)
 
         # the first state var is time-iterator.
         index = 0
@@ -342,14 +214,14 @@ class CustomRnnRewriter(LoopRewriterBase):
 
     def _extract_and_register_cell_graph_info(self, context, scan_props, scan_node):
         log.debug("_extract_cell_graph_nodes")
-
-        sub_graph_inputs = scan_props.loop_state_inputs + scan_props.loop_scan_inputs
-        sub_graph_outputs = scan_props.loop_state_outputs + scan_props.loop_scan_outputs
-        body_graph_meta = SubGraphMetadata(self.g, sub_graph_inputs, sub_graph_outputs,
-                                           scan_props.initial_state_and_scan_inputs)
+        body_graph_meta = SubGraphMetadata(self.g, scan_props.loop_state_inputs, scan_props.loop_scan_inputs,
+                                           scan_props.loop_state_outputs, scan_props.loop_scan_outputs,
+                                           scan_props.initial_state_inputs, scan_props.initial_scan_inputs)
 
         # according to input and output, find the body graph
-        nodes, enter_nodes = self.find_subgraph(body_graph_meta, self.g)
+        input_ids = body_graph_meta.input_ids
+        output_ids = body_graph_meta.output_ids
+        nodes, enter_nodes, _ = self.find_subgraph(set(input_ids), set(output_ids), self.g)
         other_enter_input_ids = []
         for enter_node in enter_nodes:
             # connect Enter's output to Enter's input
@@ -503,7 +375,11 @@ class CustomRnnLateRewriter(object):
                 continue
 
             body_graph_meta = BodyGraphDict.pop_body_graph_info(scan_node.name)
-            onnx_nodes, _ = LoopRewriterBase.find_subgraph(body_graph_meta, self.g)
+            input_ids = body_graph_meta.input_ids
+            if body_graph_meta.other_enter_input_ids:
+                input_ids += body_graph_meta.other_enter_input_ids
+            output_ids = body_graph_meta.output_ids
+            onnx_nodes, _, _ = LoopRewriterBase.find_subgraph(input_ids, output_ids, self.g)
 
             log.debug("start creating body graph for scan node %s ", scan_node.name)
             const_nodes = [n for n in onnx_nodes if n.type in ("Const", "ConstV2")]
@@ -538,7 +414,7 @@ class CustomRnnLateRewriter(object):
                     loop_input_shape = list(shape)
 
                 val = utils.make_onnx_inputs_outputs(input_name, dtype, loop_input_shape)
-                body_g.add_model_input(input_name, val)
+                body_g.add_model_input(val)
                 i += 1
 
             log.debug("start preparing body graph outputs nodes")

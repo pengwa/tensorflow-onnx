@@ -179,15 +179,32 @@ class RNNUnitType(Enum):
 
 # describe the body graph's input and output node
 class SubGraphMetadata(object):
-    def __init__(self, g, input_ids, output_ids, initial_input_ids):
+    def __init__(self, g, state_input_ids, scan_input_ids, state_output_ids, scan_output_ids,
+                 initial_state_input_ids, initial_scan_input_ids):
         self.g = g
-        self.input_ids = input_ids
-        self.output_ids = output_ids
+        self.state_input_ids = state_input_ids
+        self.scan_input_ids = scan_input_ids
 
-        self.initial_input_ids = initial_input_ids
+        self.state_output_ids = state_output_ids
+        self.scan_output_ids = scan_output_ids
+
+        self.initial_state_input_ids = initial_state_input_ids
+        self.initial_scan_input_ids = initial_scan_input_ids
 
         # sub-graph boundary
         self.other_enter_input_ids = []
+
+    @property
+    def input_ids(self):
+        return self.state_input_ids + self.scan_input_ids
+
+    @property
+    def output_ids(self):
+        return self.state_output_ids + self.scan_output_ids
+
+    @property
+    def initial_input_ids(self):
+        return self.initial_state_input_ids + self.initial_scan_input_ids
 
 
 class BodyGraphDict():
@@ -216,8 +233,8 @@ class BodyGraphDict():
     @staticmethod
     def get_body_graph_output_names():
         output_names = []
-        for k in BodyGraphDict.BODY_GRAPH_DICT:
-            _output_names = BodyGraphDict.BODY_GRAPH_DICT[k].output_ids
+        for v in BodyGraphDict.BODY_GRAPH_DICT.values():
+            _output_names = v.output_ids
             output_names.extend(_output_names)
         return set(output_names)
 

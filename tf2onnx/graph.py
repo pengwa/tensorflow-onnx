@@ -33,6 +33,7 @@ class Node(object):
         self._input = [i for i in node.input]
         self._output = [i for i in node.output]
         self._attr = {}
+        self._body_graphs_by_attr_name = {}
         self.inserted_nchw = False
 
         graph.set_node_by_name(self)
@@ -62,7 +63,7 @@ class Node(object):
     @property
     def inputs(self):
         """Input node objects."""
-        val = [self.graph.get_node_by_output(n) for n in self._input]
+        val = [self.graph.get_node_by_output_recursively(n) for n in self._input]
         return val
 
     @property
@@ -136,6 +137,13 @@ class Node(object):
         else:
             attr = 0
         return attr
+
+    def get_body_graphs(self):
+        return self._body_graphs_by_attr_name
+
+    def set_body_graph_as_attr(self, attr_name, graph):
+        self._body_graphs_by_attr_name[attr_name] = graph
+        graph.parent_g = self.graph
 
     def set_attr(self, name, value):
         self.attr[name] = helper.make_attribute(name, value)
@@ -253,48 +261,45 @@ class Node(object):
             self._op.output.remove(node)
         self._op.output.extend(self.output)
 
-    def get_implicit_inputs(self, require_input_in_cur_graph=False):
+        # update attributes to proto
+        del self._op.attribute[:]
+        body_graphs = self.get_body_graphs()
+        for attr_name, b_g in body_graphs.items():
+            graph_proto = b_g.make_graph("graph doc of " + attr_name, attr_name + " of node " + self.name)
+            g_attr = helper.make_attribute(attr_name, graph_proto)
+            self.set_attr_onnx(g_attr)
+        attr = [a for a in self.attr_onnx.values()]
+        if attr:
+            self._op.attribute.extend(attr)
+
+    def get_implicit_inputs(self):
         """Get implicit inputs if the node has attributes being GraphProto."""
-        body_graphs = [a.g for a in self.attr_onnx.values() if a.HasField('g')]
+        body_graphs = self.get_body_graphs()
         outer_scope_node_input_ids = set()
-        for sub_g in body_graphs:
+        for sub_g in body_graphs.values():
             outer_scope_node_input_ids |= self._get_implicit_inputs(sub_g)
 
-        if require_input_in_cur_graph:
-            # only find referenced node in current graph
-            implicit_inputs_in_current_graph = set()
-            for input_id in outer_scope_node_input_ids:
-                n = self.graph.get_node_by_output(input_id)
-                if n is None:
-                    if not self.graph.is_initializer(input_id):
-                        if input_id not in self.graph.model_inputs:
-                            continue
-                implicit_inputs_in_current_graph.add(input_id)
-            return implicit_inputs_in_current_graph
         return outer_scope_node_input_ids
 
     @staticmethod
     def _get_implicit_inputs(onnx_graph, recursive=True):
         """Get implicit inputs for specified onnx graph."""
         node_map = set()
-        for n in onnx_graph.node:
+        for n in onnx_graph.get_nodes():
             node_map |= set(n.output)
 
-        for n in onnx_graph.input:
-            node_map.add(n.name)
+        for n in onnx_graph.model_inputs:
+            node_map.add(n)
 
         outer_scope_node_input_ids = set()
-        for n in onnx_graph.node:
+        for n in onnx_graph.get_nodes():
             for i in n.input:
                 if i not in node_map:
                     outer_scope_node_input_ids.add(i)
 
         if recursive:
-            for n in onnx_graph.node:
-                for attr in n.attribute:
-                    sub_g = attr.g
-                    if sub_g:
-                        outer_scope_node_input_ids |= Node._get_implicit_inputs(sub_g)
+            for n in onnx_graph.get_nodes():
+                outer_scope_node_input_ids |= n.get_implicit_inputs()
 
         return outer_scope_node_input_ids
 
@@ -327,6 +332,7 @@ class Graph(object):
         self._opset = find_opset(opset)
         self._extra_opset = extra_opset
         self.output_names = output_names
+        self.parent_g = None
         ops = [Node(node, self) for node in nodes]
 
         # add identity node after each output, in case it is renamed during conversion.
@@ -444,20 +450,12 @@ class Graph(object):
         for node in self._nodes:
             node.update_proto()
 
-        # update attributes to proto
-        for op in self.get_nodes():
-            onnx_op = op.op
-            del onnx_op.attribute[:]
-            attr = [a for a in op.attr_onnx.values()]
-            if attr:
-                onnx_op.attribute.extend(attr)
-
     def get_nodes(self):
         """Get node list."""
         return self._nodes
 
     def get_node_by_output(self, output):
-        """Get node by node output id"""
+        """Get node by node output id."""
         name = self._output_to_node_name.get(output)
         ret = None
         if name:
@@ -465,6 +463,17 @@ class Graph(object):
         else:
             ret = self._get_initializer_as_const_node(output)
 
+        return ret
+
+    def get_node_by_output_recursively(self, output):
+        """Get node by node output id recursively going through nested graphs."""
+        ret = self.get_node_by_output(output)
+        g = self.parent_g
+        while not ret and g:
+            ret = g.get_node_by_output(output)
+            if ret:
+                return ret
+            g = g.parent_g
         return ret
 
     def get_node_by_name(self, name):
@@ -475,7 +484,7 @@ class Graph(object):
         return ret
 
     def _get_initializer_as_const_node(self, name):
-        """Create dummy const node representing initializers for easier node manipulation"""
+        """Create dummy const node representing initializers for easier node manipulation."""
         ret = None
         # if we processed the graph fully, set_nodes() the graph has no longer const nodes
         # since we moved them to be initializers. But all graph processing code uses Node
@@ -493,10 +502,10 @@ class Graph(object):
         for op_output in node.output:
             self._output_to_node_name[op_output] = node.name
 
-    def add_model_input(self, name, tensor_value_info):
-        """Add placeholder node as model's input"""
-        if name not in self._model_inputs:
-            self._model_inputs[name] = tensor_value_info
+    def add_model_input(self, tensor_value_info):
+        """Add placeholder node as model's input."""
+        if tensor_value_info.name not in self._model_inputs:
+            self._model_inputs[tensor_value_info.name] = tensor_value_info
         else:
             raise ValueError("model input already exists")
 
@@ -620,6 +629,7 @@ class Graph(object):
         """
         self.delete_unused_nodes(self.output_names)
         self.topological_sort(self.get_nodes())
+        # update attributes
         self.update_proto()
 
         # TODO: we'd want to do something like this so that transpose optimizer is active
@@ -638,7 +648,6 @@ class Graph(object):
             v = utils.make_onnx_inputs_outputs(name, dtype, self.get_shape(name))
             output_tensor_values.append(v)
 
-        # update attributes
         ops = []
         all_inputs = set()
         for op in self.get_nodes():
@@ -835,35 +844,59 @@ class Graph(object):
     def remove_deleted_nodes(ops):
         return [node for node in ops if not node.is_deleted()]
 
-    def _extract_sub_graph_nodes(self, dest_node):
-        """
-        return related nodes of specified node
-        :param dest_node: the specified node
-        :return: set of related nodes
+    def _extract_sub_graph_nodes(self, dest_node, input_checker):
+        """Return nodes of subgraph ending with dest_node.
+        Args:
+            dest_node: output node of the subgraph to find
+            input_checker: customized input check function: bool func(node)
+
+        Return:
+            a set of nodes
         """
         res_set = set()
         processing_set = set([dest_node])
+        if not dest_node:
+            return res_set
+
         while processing_set:
             top_node = processing_set.pop()
             res_set.add(top_node)
-            implicit_inputs = [self.get_node_by_output(node_output) for node_output in top_node.get_implicit_inputs()]
-            for node in top_node.inputs + implicit_inputs:
+            all_inputs = top_node.input + list(top_node.get_implicit_inputs())
+            for input_id in all_inputs:
+                node = self.get_node_by_output(input_id)
                 if not node:
-                    # some node (for example Scan) has optional inputs, which
-                    # might has empty input.
+                    if input_id in self.model_inputs or self.is_initializer(input_id):
+                        pass
+                    else:
+                        implicit_input = self.get_node_by_output_recursively(input_id)
+                        if not implicit_input:
+                            print("WARINING: node " + top_node.name + "'s input ["+ input_id +"] not exist in output map")
+                        # node is allowed to None for few reasons:
+                        # 1). some node (for example Scan) has optional inputs, which might has empty input.
+                        # 2). subgraph might has input defined in outer graph
+
                     continue
+
                 if node not in res_set:
+                    if input_checker and input_checker(node) is False:
+                        continue
+
                     processing_set.add(node)
         return res_set
 
-    def extract_sub_graph_nodes(self, outputs_name):
-        """
-        find related nodes of specified list of nodes
+    def extract_sub_graph_nodes(self, output_ids, input_checker=None):
+        """Return nodes of subgraph having output_ids as outputs.
+        Args:
+            output_ids: output node output id of the subgraph to find
+            input_checker: customized input check function: bool func(node)
+
+        Return:
+            a list of nodes
         """
         res_set = set()
-        for output in outputs_name:
+        for output in output_ids:
             node = self.get_node_by_output(output)
-            res_set = res_set.union(self._extract_sub_graph_nodes(node))
+            res_set = res_set.union(self._extract_sub_graph_nodes(node, input_checker))
 
         # const nodes made at conversion stage are not needed, because ONNX will use initializer automatically
         not_need_const = set()
@@ -874,9 +907,8 @@ class Graph(object):
         res_set = res_set - not_need_const
         return list(res_set)
 
-    def delete_unused_nodes(self, outputs_name):
-        """
-        example of unused nodes: loop nodes generated by tensorflow rnn such as switch, loop_cond
-        """
-        related_nodes = self.extract_sub_graph_nodes(outputs_name)
+    def delete_unused_nodes(self, output_names):
+        """Delete nodes not in subgraph ending with output_names."""
+        print("delete_unused_nodes: ", output_names)
+        related_nodes = self.extract_sub_graph_nodes(output_names)
         self.set_nodes(related_nodes)

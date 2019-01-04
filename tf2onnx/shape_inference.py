@@ -60,7 +60,7 @@ def infer_shape_for_node(g, node):
     if node.type in ["Cast", "Enter", "Floor", "ReverseSequence", "Sigmoid", "Tanh", "Identity"]:
         return set_shape_from_input(g, node.input[0], node.output[0])
 
-    if node.type in ["Add", "GreaterEqual", "Mul", "RealDiv", "Sub"]:
+    if node.type in ["Add", "GreaterEqual", "Less", "LogicalAnd", "Mul", "RealDiv", "Sub"]:
         return set_shape_from_inputs_broadcast(g, node.input, node.output[0])
 
     if node.type == "Placeholder":

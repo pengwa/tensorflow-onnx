@@ -10,23 +10,37 @@ from __future__ import print_function
 import copy
 import logging
 from collections import deque
+from tf2onnx import utils
+from tf2onnx.graph_matcher import OpTypePattern, GraphMatcher
 from tf2onnx.rewriter.rnn_utils import is_loopcond_op, is_tensor_array_op, is_tensor_array_write_op
-from tf2onnx.rewriter.rnn_utils import BodyGraphDict, REWRITER_RESULT
+from tf2onnx.rewriter.rnn_utils import is_tensor_array_gather_op, is_tensor_array_write_op
+from tf2onnx.rewriter.rnn_utils import BodyGraphDict, REWRITER_RESULT, SubGraphMetadata
+from tf2onnx.graph import Node, Graph
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tf2onnx.rewriter.loop_rewriter_base")
-
+INVLAID_INPUT_ID = "invalid:0"
 # pylint: disable=missing-docstring,invalid-name,unused-argument,using-constant-test
 
-
-class Context:
+class Context(object):
     def __init__(self):
         self.need_keep_nodes = []
         self.while_context_scope = None
         self.loop_variables = {}
+        self.loop_cond = None
 
+        self.input_tas = []
+        self.loop_properties = None
+        self.cell_graph = None
+        self.cond_graph = None
 
-class LoopVariable:
+class GraphInfo(object):
+    def __init__(self, ops, inputs, outputs):
+        self.nodes = ops
+        self.inputs = inputs
+        self.outputs = outputs
+
+class LoopVariable(object):
     def __init__(self, enter_name, enter_input_id, next_iteration_input_id,
                  switch_true_identity_output_id, exit_output_id, is_tensor_array):
         self.enter_name = enter_name
@@ -39,10 +53,37 @@ class LoopVariable:
         self.ta_index_id = None
 
 
-class LoopRewriterBase:
+class LoopProperties(object):
+    def __init__(self, initial_state_inputs, initial_scan_inputs, loop_state_inputs,
+                 loop_state_outputs, loop_scan_inputs, loop_scan_outputs):
+        self.initial_state_inputs = initial_state_inputs
+        self.initial_scan_inputs = initial_scan_inputs
+        self.loop_state_inputs = loop_state_inputs
+        self.loop_state_outputs = loop_state_outputs
+        self.loop_scan_inputs = loop_scan_inputs
+        self.loop_scan_outputs = loop_scan_outputs
+
+
+class TensorArrayProp(object):
+    def __init__(self):
+        self.index_input_id = None
+        self.data_input_id = None
+        self.output_id = None
+
+
+class LoopRewriterBase(object):
     def __init__(self, g):
         self.g = g
-        self.keep_nodes_global = []
+        self.ta_read_input_pattern = \
+            OpTypePattern('TensorArrayReadV3', name='ta_read', inputs=[
+                OpTypePattern("Enter", name="ta_enter", inputs=[
+                    OpTypePattern("TensorArrayV3")
+                ]),
+                OpTypePattern('*'),
+                OpTypePattern("Enter", name="ta_scatter_enter", inputs=[
+                    OpTypePattern("TensorArrayScatterV3", name="ta_input_scatter")
+                ]),
+            ])
 
     def create_context(self):
         return Context()
@@ -60,8 +101,22 @@ class LoopRewriterBase:
                 log.debug("======================")
                 log.debug("found LoopCond op named %s", n.name)
                 context = self.create_context()
+                context.loop_cond = n
                 self._parse_loop_variables(n, context)
+                self._parse_input_ta(context)
                 if self.need_rewrite(context):
+                    self._compose_body_graph_inputs_and_outputs(context)
+                    # cut off connection between cell/cond graphs and useless node like Merge, NextIteration.
+                    to_remove = self._cut_off_connection_for_cell(context)
+                    all_nodes = self.g.get_nodes()
+                    for n in set(to_remove):
+                        if n in all_nodes:
+                            all_nodes.remove(n)
+                    self.g.set_nodes(all_nodes)
+
+                    context.cell_graph = self._crop_loop_body_sub_graph(context)
+                    context.cond_graph = self._crop_loop_condition_sub_graph(context)
+
                     _result = self.rewrite(context)
                     if _result == REWRITER_RESULT.OK:
                         log.debug("rewrite successfully")
@@ -71,9 +126,11 @@ class LoopRewriterBase:
                     elif _result == REWRITER_RESULT.FAIL:
                         raise ValueError("rewrite failed, so just fast fail it")
         all_output_name = copy.deepcopy(self.g.output_names)
+
         if all_output_name:
-            all_output_name.extend(BodyGraphDict.get_body_graph_output_names())
+            #all_output_name.extend(BodyGraphDict.get_body_graph_output_names())
             self.g.delete_unused_nodes(all_output_name)
+
         return self.g.get_nodes()
 
     def _parse_loop_variables(self, loop_cond_op, context):
@@ -91,6 +148,150 @@ class LoopRewriterBase:
                 raise ValueError("duplicated enter name registered")
 
             context.loop_variables[loop_var.enter_name] = loop_var
+
+    def _parse_output_ta(self, loop_var):
+        # here we parse patterns generated by 
+        # ta.write(), then ta.stack(), because this is the most frequent usage pattern.
+        ta_write_node = self.g.get_node_by_output(loop_var.next_iteration_input_id)
+        utils.make_sure(is_tensor_array_write_op(ta_write_node), "ta var nextiteration is not following ta write op")
+        loop_var.next_iteration_input_id = ta_write_node.input[2]
+
+        if loop_var.exit_output_id:
+            exit_consumers = self.g.find_output_consumers(loop_var.exit_output_id)
+            ta_gather_node = [n for n in exit_consumers if is_tensor_array_gather_op(n)][0]
+
+            # update exit output id, treat the gather output as ta's output
+            loop_var.exit_output_id = ta_gather_node.output[0]
+
+        log.debug("output ta %s - next_iteration_input (%s) shape: %s, output (%s) shape: %s", loop_var.enter_name,
+                    loop_var.next_iteration_input_id, self.g.get_shape(loop_var.next_iteration_input_id),
+                    loop_var.exit_output_id, self.g.get_shape(loop_var.exit_output_id))
+
+    def _parse_input_ta(self, context):
+        matcher = GraphMatcher(self.ta_read_input_pattern, allow_reorder=True)
+        match_results = list(matcher.match_ops(self.g.get_nodes()))
+        match_results = [r for r in match_results if r.get_op("ta_input_scatter").name.startswith(context.rnn_scope)]
+        for match in match_results:
+            ta_input_scatter = match.get_op("ta_input_scatter")
+            # the 3rd input of scatter is the value
+            input_ta = TensorArrayProp()
+
+            # dynamic_rnn specific approach.
+            input_ta.data_input_id = ta_input_scatter.input[2]
+
+            ta_read_node = match.get_op("ta_read")
+            input_ta.index_input_id = ta_read_node.input[1]
+            input_ta.output_id = match.get_op("ta_read").output[0]
+
+            input_shape = self.g.get_shape(input_ta.data_input_id)
+            output_shape = self.g.get_shape(input_ta.output_id)
+            if output_shape is None and input_shape is not None:
+                self.g.set_shape(input_ta.output_id, input_shape[1:])
+
+            context.input_tas.append(input_ta)
+
+            log.debug("input ta %s - data input (%s) shape: %s, output (%s) shape: %s", ta_read_node.name,
+                      input_ta.data_input_id, self.g.get_shape(input_ta.data_input_id),
+                      input_ta.output_id, self.g.get_shape(input_ta.output_id))
+
+    def _crop_loop_body_sub_graph(self, context):
+        # according to input and output, find the body graph
+        loop_props = context.loop_properties
+        input_ids = loop_props.loop_state_inputs + loop_props.loop_scan_inputs
+        output_ids = loop_props.loop_state_outputs + loop_props.loop_scan_outputs
+
+        ops, enter_nodes, _ = self.find_subgraph(set(input_ids), set(output_ids), self.g, merge_as_end=False)
+
+        other_enter_input_ids = []
+        for enter_node in enter_nodes:
+            # connect Enter's output to Enter's input
+            self.g.replace_all_inputs(ops, enter_node.output[0], enter_node.input[0])
+            other_enter_input_ids.append(enter_node.input[0])
+
+        return GraphInfo(ops, input_ids, output_ids)
+
+    def _crop_loop_condition_sub_graph(self, context):
+        # according to input and output, find the body graph
+        loop_props = context.loop_properties
+        input_ids = loop_props.loop_state_inputs + loop_props.loop_scan_inputs
+        output_ids = [context.loop_cond.input[0]]
+        ops, enter_nodes, merge_nodes = self.find_subgraph(set(input_ids), set(output_ids), self.g, merge_as_end=True)
+
+        other_enter_input_ids = []
+        for enter_node in enter_nodes:
+            # connect Enter's output to Enter's input
+            self.g.replace_all_inputs(ops, enter_node.output[0], enter_node.input[0])
+            other_enter_input_ids.append(enter_node.input[0])
+
+        for merge_node in merge_nodes:
+            enter_node = [n for n in merge_node.inputs if n.type == "Enter"][0]
+            loop_var = context.loop_variables[enter_node.name]
+
+            # cut off connection between condition graph and Merge node.
+            non_switch_consumers = [n for n in self.g.find_output_consumers(merge_node.output[0]) if n.type != "Switch"]
+            self.g.replace_all_inputs(non_switch_consumers, merge_node.output[0], loop_var.switch_true_identity_output_id)
+            utils.make_sure(loop_var.switch_true_identity_output_id in input_ids,
+                            "Merge op related loop var should already in the inputs")
+
+        # cut off connection between condition graph and LoopCond node.
+        self.g.replace_all_inputs([context.loop_cond], context.loop_cond.output[0], INVLAID_INPUT_ID)
+
+        return GraphInfo(ops, input_ids, output_ids)
+
+    def _cut_off_connection_for_cell(self, context):
+        nodes_to_remove = []
+        for val in context.loop_variables.values():
+            # remove the node to cut off a starting node of the cell (e.g. loop body).
+            nodes_to_remove.append(self.g.get_node_by_output(val.switch_true_identity_output_id))
+
+            if val.is_tensor_array:
+                # remove the node to cut off connection between scan_output and the cell.
+                ta_write_nodes = [n for n in self.g.get_nodes() if is_tensor_array_write_op(n)]
+                self.g.replace_all_inputs(ta_write_nodes, val.next_iteration_input_id, INVLAID_INPUT_ID)
+            else:
+                # connect NextIteration to an invalid node, to cut off a ending node of the cell.
+                next_iter_nodes = [n for n in self.g.get_nodes() if n.type == "NextIteration"]
+                self.g.replace_all_inputs(next_iter_nodes, val.next_iteration_input_id, INVLAID_INPUT_ID)
+
+        for input_ta in context.input_tas:
+            # remove the node to cut off connection between scan_input and the cell.
+            nodes_to_remove.append(self.g.get_node_by_output(input_ta.output_id))
+
+        return nodes_to_remove
+
+    def _compose_body_graph_inputs_and_outputs(self, context):
+        log.debug("_compose_body_inputs_and_outputs")
+
+        loop_state_inputs = []
+        loop_state_outputs = []
+        loop_scan_outputs = []
+        initial_state_inputs = []
+        initial_scan_inputs = []
+        # put state variables ahead of scan variables.
+        for var in context.loop_variables.values():
+            if var.is_tensor_array:
+                continue
+            loop_state_inputs.append(var.switch_true_identity_output_id)
+            loop_state_outputs.append(var.next_iteration_input_id)
+            initial_state_inputs.append(var.enter_input_id)
+
+        for var in context.loop_variables.values():
+            if not var.is_tensor_array:
+                continue
+            log.debug("prepare cell scan outputs")
+            self._parse_output_ta(var)
+            loop_scan_outputs.append(var.next_iteration_input_id)
+
+        log.debug("prepare cell scan inputs")
+        loop_scan_inputs = []
+        for input_ta in context.input_tas:
+            loop_scan_inputs.append(input_ta.output_id)
+            initial_scan_inputs.append(input_ta.data_input_id)
+
+        loop_props = LoopProperties(initial_state_inputs, initial_scan_inputs, loop_state_inputs, loop_state_outputs,
+                                    loop_scan_inputs, loop_scan_outputs)
+        context.loop_properties = loop_props
+        return loop_props
 
     def _get_loop_var_from_switch(self, switch_node):
         if switch_node.type != 'Switch':
@@ -141,7 +342,7 @@ class LoopRewriterBase:
         loop_var = LoopVariable(enter_node.name, target_node_input_id, last_iteration_output_id,
                                 identity_node.output[0], exit_output_id, is_ta)
         loop_var = self._tune_shape_for_loop_var(loop_var)
-        loop_var = self._tune_shape_for_loop_ta_var(loop_var)
+        #loop_var = self._tune_shape_for_loop_ta_var(loop_var)
         return loop_var
 
     def _tune_shape_for_loop_ta_var(self, loop_var):
@@ -190,68 +391,56 @@ class LoopRewriterBase:
         return loop_var
 
     @staticmethod
-    def find_subgraph(graph_meta, g):
-        input_ids = graph_meta.input_ids
-        if graph_meta.other_enter_input_ids:
-            input_ids += graph_meta.other_enter_input_ids
+    def find_subgraph(input_ids, output_ids, g, merge_as_end=False):
+        log.info("input ids %s ", input_ids)
+        log.info("output ids %s ", output_ids)
 
-        input_ids = set(input_ids)
-        output_ids = set(graph_meta.output_ids)
-        log.debug("input ids %s ", input_ids)
-        log.debug("output ids %s ", output_ids)
-        nodes = []
-        q = deque()
-        output_nodes = [g.get_node_by_output(output_id) for output_id in output_ids]
-        handled_nodes = []
-        q.extend(output_nodes)
-        nodes.extend(output_nodes)
         enter_nodes = set()
-        while q:
-            n = q.popleft()
-            if not n:
-                continue
-            if n in handled_nodes:
-                continue
+        merge_nodes = set()
 
-            handled_nodes.append(n)
+        def find_input_boundary(node):
+            if node.type == "Enter":
+                enter_nodes.add(node)
+                log.debug("terminate the input search at %s", node.name)
+                return False
+            elif merge_as_end is True and node.type == "Merge":
+                merge_nodes.add(node)
+                log.debug("terminate the input search at %s", node.name)
+                return False
+            elif node.is_const():
+                log.debug("terminate search at const node %s", node.name)
+                return False
 
-            n_inputs = set(n.input)
-            for i in n_inputs:
-                input_node = g.get_node_by_output(i)
-                if i in input_ids:
-                    log.debug("terminate the input search at %s", i)
-                elif not input_node:
-                    if i in g.model_inputs:
-                        log.debug("find a model input, which might be a placeholder")
-                    elif g.is_initializer(i):
-                        log.debug("find an initializer, this might be generated during op conversion")
-                    else:
-                        log.error("input node does not exist, node name is: [%s] ", i)
-                        raise ValueError("failed to get input")
-                elif input_node.type == "Enter":
-                    enter_nodes.add(input_node)
-                    log.debug("terminate the input search at %s", i)
-                else:
-                    log.debug("add node %s into sub graph %s", input_node.name, n.name)
-                    if input_node not in nodes:
-                        nodes.append(input_node)
-                    q.append(input_node)
+            for o in node.output:
+                if o in input_ids:
+                    return False
+            return True
 
-            implicit_inputs = n.get_implicit_inputs(require_input_in_cur_graph=True)
-            n_inputs = set(implicit_inputs)
-            for i in n_inputs:
-                input_node = g.get_node_by_output(i)
-                if i in input_ids:
-                    log.debug("terminate the input search at %s", i)
-                elif not input_node:
-                    log.debug("implicit input is initializer or input in main graph, node name is: [%s] ", i)
-                elif input_node.type == "Enter":
-                    enter_nodes.add(input_node)
-                    log.debug("terminate the input search at %s", i)
-                else:
-                    log.debug("add node %s into sub graph %s", input_node.name, n.name)
-                    if input_node not in nodes:
-                        nodes.append(input_node)
-                    q.append(input_node)
+        nodes = g.extract_sub_graph_nodes(output_ids, input_checker=find_input_boundary)
+        return nodes, enter_nodes, merge_nodes
 
-        return nodes, enter_nodes
+    @staticmethod
+    def construct_graph_from_nodes(parent_g, nodes, output_ids):
+        log.debug("construct_graph_from_nodes")
+
+        nodes = set(nodes)
+        all_inputs_and_outputs = set()
+        ops = []
+        for op in nodes:
+            all_inputs_and_outputs |= set(op.input)
+            all_inputs_and_outputs |= set(op.get_implicit_inputs())
+            all_inputs_and_outputs |= set(op.output)
+            op.update_proto()
+            onnx_op = op.op
+            ops.append(onnx_op)
+
+        out_shapes = {}
+        out_dtypes = {}
+        for i in all_inputs_and_outputs:
+            if i not in out_shapes:
+                out_shapes[i] = parent_g._output_shapes[i]
+            if i not in out_dtypes:
+                out_dtypes[i] = parent_g._dtypes[i]
+
+        g = Graph(ops, output_shapes=out_shapes, dtypes=out_dtypes, output_names=output_ids)
+        return g

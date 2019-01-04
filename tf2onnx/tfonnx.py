@@ -30,6 +30,7 @@ from tf2onnx.rewriter.rnn import rewrite_custom_rnn_cell, rewrite_custom_rnn_bod
 from tf2onnx.rewriter.rnn import rewrite_single_direction_gru
 from tf2onnx.rewriter.rnn import rewrite_single_direction_grublock
 from tf2onnx.rewriter.rnn import rewrite_single_direction_lstm, rewrite_bi_direction_lstm
+from tf2onnx.rewriter.rnn import rewrite_generic_loop #, rewrite_generic_loop_body_graph
 from tf2onnx.rewriter.rnn_utils import is_tensor_array_op
 from tf2onnx.shape_inference import infer_shape_for_graph, set_shape_from_inputs_broadcast
 from tf2onnx.utils import port_name
@@ -187,7 +188,8 @@ def direct_op(ctx, node, name, args):
 
 def identity_op(ctx, node, name, args):
     """Identity."""
-    if node.inputs[0].is_const():
+    input_node = node.inputs[0]
+    if input_node and input_node.is_const():
         # should not remove the identity node if it is output of the graph
         if node.output[0] in ctx.output_names:
             return node
@@ -379,7 +381,7 @@ def placeholder_op(ctx, node, name, args):
     input_node = utils.make_onnx_inputs_outputs(node.output[0],
                                                 node.dtype,
                                                 output_shape)
-    ctx.add_model_input(input_node.name, input_node)
+    ctx.add_model_input(input_node)
     return None
 
 
@@ -1882,6 +1884,10 @@ _OPSET_7 = {
     "Tan": (direct_op, []),
     "Tile": (tile_op7, []),
     "TruncateDiv": (broadcast_op7, ["Div"]),
+
+    # workaround created ONNX node in pre-rewriters
+    "If": (direct_op, []),
+    "Loop": (direct_op, []),
 }
 
 _OPSET_8 = {
@@ -2304,7 +2310,7 @@ def tensorflow_onnx_mapping(g, continue_on_error, custom_op_handlers):
                 onnx_nodes.append(node)
                 continue
             else:
-                raise ValueError("tensorflow op " + op + " is not supported")
+                raise ValueError("tensorflow op " + op + " named " + node.name + " is not supported")
         mapped_op[op] += 1
         func, args = map_info
         onnx_node = None
@@ -2312,6 +2318,14 @@ def tensorflow_onnx_mapping(g, continue_on_error, custom_op_handlers):
             node.type = args[0]
             args = args[1:]
         try:
+            body_graphs = node.get_body_graphs()
+            # we assume only ONNX nodes have subgraph defined in pre-rewriters.
+            for attr, b_g in body_graphs.items():
+                print(">>>>>>>>", node.name, attr)
+                b_g.topological_sort(b_g.get_nodes())
+                m_ops, unm_ops = tensorflow_onnx_mapping(b_g, continue_on_error, custom_op_handlers)
+                mapped_op += m_ops
+                unmapped_op += unm_ops
             onnx_node = func(g, node, node.name, args)
         except Exception as ex:
             type_, value_, traceback_ = sys.exc_info()
@@ -2419,6 +2433,7 @@ def process_tf_graph(tf_graph, continue_on_error=False, verbose=False, target=No
     g = Graph(onnx_nodes, output_shapes, dtypes, target, opset, extra_opset, output_names)
 
     infer_shape_for_graph(g)
+    print(g._output_shapes)
 
     if inputs_as_nchw:
         transpose_inputs(g, inputs_as_nchw)
@@ -2431,7 +2446,8 @@ def process_tf_graph(tf_graph, continue_on_error=False, verbose=False, target=No
                  rewrite_single_direction_lstm, rewrite_bi_direction_lstm,
                  rewrite_single_direction_gru, rewrite_single_direction_grublock,
                  rewrite_bi_direction_gru, rewrite_custom_rnn_cell,
-                 rewrite_logical_compare_with_equal
+                 rewrite_logical_compare_with_equal,
+                 rewrite_generic_loop
                  ]
 
     if custom_rewriter is not None:
@@ -2458,7 +2474,9 @@ def process_tf_graph(tf_graph, continue_on_error=False, verbose=False, target=No
     mapped_op, unmapped_op = tensorflow_onnx_mapping(g, continue_on_error, custom_op_handlers)
 
     # post-processing rewriters
-    late_rewriters = [rewrite_custom_rnn_body_graph]
+    late_rewriters = [rewrite_custom_rnn_body_graph, 
+                      #rewrite_generic_loop_body_graph
+                      ]
     if TARGET_RS5 in target:
         late_rewriters.append(rewrite_incomplete_type_support_rs5)
     if TARGET_RS6 in target:

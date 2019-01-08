@@ -18,7 +18,7 @@ from backend_test_base import Tf2OnnxBackendTestBase
 # pylint: disable=abstract-method,arguments-differ
 
 class CustomRnnCellTests(Tf2OnnxBackendTestBase):
-
+    '''
     def test_single_dynamic_custom_rnn(self):
         size = 5  # size of each model layer.
         batch_size = 1
@@ -36,6 +36,7 @@ class CustomRnnCellTests(Tf2OnnxBackendTestBase):
         input_names_with_port = ["input_1:0"]
         output_names_with_port = ["output:0", "final_state:0"]
         self.run_test_case(feed_dict, input_names_with_port, output_names_with_port, 0.1)
+
 
     def test_single_dynamic_custom_rnn_time_major(self):
         size = 5  # size of each model layer.
@@ -77,7 +78,7 @@ class CustomRnnCellTests(Tf2OnnxBackendTestBase):
         input_names_with_port = ["input_1:0"]
         output_names_with_port = ["output:0", "cell_state:0"]
         self.run_test_case(feed_dict, input_names_with_port, output_names_with_port, rtol=1e-06)
-
+    '''
     def test_single_dynamic_custom_rnn_with_non_const_seq_length(self):
         units = 5
         batch_size = 6

@@ -22,7 +22,7 @@ from tf2onnx.tfonnx import utils
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tf2onnx.rewriter.custom_rnn_rewriter")
-INVLAID_INPUT_ID = "invalid:0"
+
 
 # pylint: disable=missing-docstring,invalid-name,unused-argument,using-constant-test,broad-except,protected-access
 
@@ -35,17 +35,6 @@ class CustomRnnContext(Context):
 
         self.time_var = None
         self.iteration_var = None
-
-
-class ScanProperties(object):
-    def __init__(self, initial_state_inputs, initial_scan_inputs, loop_state_inputs,
-                 loop_state_outputs, loop_scan_inputs, loop_scan_outputs):
-        self.initial_state_inputs = initial_state_inputs
-        self.initial_scan_inputs = initial_scan_inputs
-        self.loop_state_inputs = loop_state_inputs
-        self.loop_state_outputs = loop_state_outputs
-        self.loop_scan_inputs = loop_scan_inputs
-        self.loop_scan_outputs = loop_scan_outputs
 
 
 class CustomRnnRewriter(LoopRewriterBase):
@@ -114,49 +103,83 @@ class CustomRnnRewriter(LoopRewriterBase):
 
         self._parse_time_var(context)
 
-        if not (context.input_tas or context.output_tas):
+        if not context.input_tas:
             log.debug("this should not be a dynamic_rnn loop, no ta input or output are found")
             return False
         return True
 
     def rewrite(self, context):
         log.debug("enter rewrite function")
-        scan_node = None
-        try:
-            scan_props = context.loop_properties
-            nodes_to_append = []
-            for i, state_input in enumerate(scan_props.initial_state_inputs):
-                nodes = self._adapt_scan_sequence_input_or_output("input", state_input, False)
-                scan_props.initial_state_inputs[i] = nodes[-1].output[0]
-                nodes_to_append.extend(nodes)
+        scan_props = context.loop_properties
+        nodes_to_append = []
+        for i, state_input in enumerate(scan_props.initial_state_variable_values):
+            nodes = self._adapt_scan_sequence_input_or_output("input", state_input, False)
+            scan_props.initial_state_variable_values[i] = nodes[-1].output[0]
+            nodes_to_append.extend(nodes)
 
-            for i, scan_input in enumerate(scan_props.initial_scan_inputs):
-                nodes = self._adapt_scan_sequence_input_or_output("input", scan_input, False)
-                scan_props.initial_scan_inputs[i] = nodes[-1].output[0]
-                nodes_to_append.extend(nodes)
+        for i, scan_input in enumerate(scan_props.initial_scan_variable_values):
+            nodes = self._adapt_scan_sequence_input_or_output("input", scan_input, False)
+            scan_props.initial_scan_variable_values[i] = nodes[-1].output[0]
+            nodes_to_append.extend(nodes)
 
-            scan_node = self._create_scan_node(context, scan_props)
-            if not scan_node:
-                log.error("failed to create scan node during rewrite")
-                return REWRITER_RESULT.FAIL
-            nodes_to_append.append(scan_node)
+        cell_g_info = context.cell_graph
+        scan_body_g = LoopRewriterBase.construct_graph_from_nodes(self.g, cell_g_info.nodes, cell_g_info.outputs)
+        loop_body_g_inputs = []
+        for input_name in scan_props.state_inputs:
+            val = utils.make_onnx_inputs_outputs(input_name, self.g.get_dtype(input_name),
+                                                 self.g.get_shape(input_name))
+            loop_body_g_inputs.append(val)
 
-            _ = self._extract_and_register_cell_graph_info(context, scan_props, scan_node)
+        for input_name in scan_props.scan_inputs:
+            shape = self.g.get_shape(input_name)
+            dtype = self.g.get_dtype(input_name)
+            val = utils.make_onnx_inputs_outputs(input_name, dtype, shape)
+            loop_body_g_inputs.append(val)
 
-            to_append = self._connect_scan_with_output(context, scan_node)
-            nodes_to_append.extend(to_append)
-            all_nodes = self.g.get_nodes()
-            all_nodes.extend(nodes_to_append)
-            self.g.set_nodes(all_nodes)
+        for i in loop_body_g_inputs:
+            scan_body_g.add_model_input(i)
 
-            return REWRITER_RESULT.OK
-        except Exception as ex:
-            tb = traceback.format_exc()
-            if scan_node and BodyGraphDict.has_body_graph_info(scan_node.name):
-                BodyGraphDict.pop_body_graph_info(scan_node.name)
-                log.error("remove scan node body graph from dict")
-            log.error("rewrite failed, due to exception: %s, details:%s", ex, tb)
+        scan_node = self._create_scan_node(context, scan_props)
+        if not scan_node:
+            log.error("failed to create scan node during rewrite")
             return REWRITER_RESULT.FAIL
+
+        # set scan output shapes and dtypes
+        index = 0
+        for state_var_init_val in scan_props.initial_state_variable_values:
+            shape = self.g.get_shape(state_var_init_val)
+            dtype = self.g.get_dtype(state_var_init_val)
+            self.g.set_shape(scan_node.output[index], shape)
+            self.g.set_dtype(scan_node.output[index], dtype)
+            index += 1
+
+        last_scan_input_shape = self.g.get_shape(scan_node.input[-1])
+        batch = last_scan_input_shape[0] # should be 1
+        utils.make_sure(batch == 1, "fake batch should be 1")
+        time = last_scan_input_shape[1]
+        for i in range(len(scan_props.scan_outputs)):
+            scan_out_dtype = scan_body_g.get_dtype(scan_props.scan_outputs[i])
+            output_shape = scan_body_g.get_shape(scan_props.scan_outputs[i])
+            scan_output_shape = [batch, time] + output_shape
+            log.debug("scan output [%s] has shape %s, batch:%s, time: %s, cell output shape: %s",
+                      scan_props.scan_outputs[i], scan_output_shape, batch, time, output_shape)
+            log.debug("_create_scan_node - set scan scan_output shape for %s[%s]:%s",
+                      scan_node.name, index, scan_output_shape)
+            self.g.set_shape(scan_node.output[index], scan_output_shape)
+            self.g.set_dtype(scan_node.output[index], scan_out_dtype)
+            index += 1
+        # set shapes and dtypes end
+
+        scan_node.set_body_graph_as_attr("body", scan_body_g)
+        nodes_to_append.append(scan_node)
+
+        to_append = self._connect_scan_with_output(context, scan_node)
+        nodes_to_append.extend(to_append)
+        all_nodes = self.g.get_nodes()
+        all_nodes.extend(nodes_to_append)
+        self.g.set_nodes(all_nodes)
+
+        return REWRITER_RESULT.OK
 
     def _parse_time_var(self, context):
         time_var = context.time_var
@@ -169,81 +192,18 @@ class CustomRnnRewriter(LoopRewriterBase):
         # here we did not give the sequence_length, because
         # current batch size is 1, not original batch size
         # original seq_length will be used by the loop body of Scan op.
-        scan_node = self.g.make_node("Scan", [""] + scan_props.initial_state_inputs + scan_props.initial_scan_inputs,
-                                     attr={"num_scan_inputs": len(scan_props.loop_scan_inputs)},
-                                     output_count=len(scan_props.loop_state_outputs + scan_props.loop_scan_outputs),
+        scan_node = self.g.make_node("Scan", [""] + scan_props.initial_state_variable_values + scan_props.initial_scan_variable_values,
+                                     attr={"num_scan_inputs": len(scan_props.scan_inputs)},
+                                     output_count=len(scan_props.state_outputs + scan_props.scan_outputs),
                                      skip_conversion=False)
-
-        # the first state var is time-iterator.
-        index = 0
-        time_input_shape = self.g.get_shape(scan_node.input[1])
-        time_input_dtype = self.g.get_dtype(scan_node.input[1])
-
-        log.debug("_create_scan_node - set scan state_output shape for %s[%s]:%s",
-                  scan_node.name, index, time_input_shape)
-        self.g.set_shape(scan_node.output[index], time_input_shape)
-        self.g.set_dtype(scan_node.output[index], time_input_dtype)
-        index += 1
-
-        # for other state vars
-        state_input_shape = self.g.get_shape(scan_node.input[2])
-        state_input_dtype = self.g.get_dtype(scan_node.input[2])
-        for i in range(len(scan_props.loop_state_outputs) - 1):
-            log.debug("_create_scan_node - set scan state_output shape for %s[%s]:%s",
-                      scan_node.name, index, state_input_shape)
-            self.g.set_shape(scan_node.output[index], state_input_shape)
-            self.g.set_dtype(scan_node.output[index], state_input_dtype)
-            index += 1
-
-        last_scan_input_shape = self.g.get_shape(scan_node.input[-1])
-        batch = last_scan_input_shape[0] # should be 1
-        time = last_scan_input_shape[1]
-        for i in range(len(scan_props.loop_scan_outputs)):
-            scan_out_dtype = self.g.get_dtype(scan_props.loop_scan_outputs[i])
-            output_shape = self.g.get_shape(scan_props.loop_scan_outputs[i])
-            scan_output_shape = [batch, time] + output_shape
-            log.debug("scan output [%s] has shape %s, batch:%s, time: %s, cell output shape: %s",
-                      scan_props.loop_scan_outputs[i], scan_output_shape, batch, time, output_shape)
-            log.debug("_create_scan_node - set scan scan_output shape for %s[%s]:%s",
-                      scan_node.name, index, scan_output_shape)
-            self.g.set_shape(scan_node.output[index], scan_output_shape)
-            self.g.set_dtype(scan_node.output[index], scan_out_dtype)
-            index += 1
-
         return scan_node
-
-    def _extract_and_register_cell_graph_info(self, context, scan_props, scan_node):
-        log.debug("_extract_cell_graph_nodes")
-        body_graph_meta = SubGraphMetadata(self.g, scan_props.loop_state_inputs, scan_props.loop_scan_inputs,
-                                           scan_props.loop_state_outputs, scan_props.loop_scan_outputs,
-                                           scan_props.initial_state_inputs, scan_props.initial_scan_inputs)
-
-        # according to input and output, find the body graph
-        input_ids = body_graph_meta.input_ids
-        output_ids = body_graph_meta.output_ids
-        nodes, enter_nodes, _ = self.find_subgraph(set(input_ids), set(output_ids), self.g)
-        other_enter_input_ids = []
-        for enter_node in enter_nodes:
-            # connect Enter's output to Enter's input
-            self.g.replace_all_inputs(self.g.get_nodes(), enter_node.output[0], enter_node.input[0])
-
-            nodes = self.g._extract_sub_graph_nodes(self.g.get_node_by_output(enter_node.input[0]))
-
-            other_enter_input_ids.append(enter_node.input[0])
-
-        body_graph_meta.other_enter_input_ids = other_enter_input_ids
-
-        log.debug("add body graph meta data into store")
-        BodyGraphDict.add_body_graph_info(scan_node.name, body_graph_meta)
-        return nodes
 
     def _connect_scan_with_output(self, context, scan_node):
         log.debug("connect scan output with the graph")
 
-        index = 1 # ignore the 1st input (time-iterator)
+        index = 0 # ignore the 1st input (time-iterator)
         nodes_to_append = []
-        for _, val in context.other_loop_vars.items():
-            var_output_id = val.exit_output_id
+        for var_output_id in context.loop_properties.state_output_exit_ids:
             if var_output_id:
                 nodes = self._adapt_scan_sequence_input_or_output("state_output_reshape",
                                                                   scan_node.output[index], True)
@@ -252,13 +212,12 @@ class CustomRnnRewriter(LoopRewriterBase):
 
             index += 1
 
-        for output_ta in context.output_tas:
-            ta_final_output_id = output_ta.output_id
-            if ta_final_output_id:
+        for var_output_id in context.loop_properties.scan_output_exit_ids:
+            if var_output_id:
                 nodes = self._adapt_scan_sequence_input_or_output("scan_output_reshape",
                                                                   scan_node.output[index], True)
                 nodes_to_append.extend(nodes)
-                self.g.replace_all_inputs(self.g.get_nodes(), ta_final_output_id, nodes[-1].output[0])
+                self.g.replace_all_inputs(self.g.get_nodes(), var_output_id, nodes[-1].output[0])
             index += 1
 
         return nodes_to_append
@@ -315,48 +274,51 @@ class CustomRnnRewriter(LoopRewriterBase):
                   reshape_node.output[0], new_shape)
         return nodes_to_add
 
+    '''
     # in theory, time var can be a scalar, but in current implementation of runtime, it could not be handled
     # correctly, so we unsqueeze it to a list containing a single element.
-    def _adapt_time_var_as_workaround(self, var):
+    def _adapt_time_var_as_workaround(self, g, context):
         log.debug("_adapt_time_var_as_workaround")
         nodes_to_append = []
         # change time shape to {1} since current Scan does not support
-        time_init_node = self._create_unsqueeze_node("time_var_init", var.enter_input_id)
+        time_init_node = self._create_unsqueeze_node(self.g, "time_var_init", context.loop_properties.initial_state_variable_values[0])
         nodes_to_append.append(time_init_node)
-        var.enter_input_id = time_init_node.output[0]
+        context.loop_properties.initial_state_variable_values[0] = time_init_node.output[0]
 
-        time_output_node = self._create_unsqueeze_node("time_var_output", var.next_iteration_input_id)
-        nodes_to_append.append(time_output_node)
-        var.next_iteration_input_id = time_output_node.output[0]
+        nodes_to_subgraph = []
+        time_output_node = self._create_unsqueeze_node(g, "time_var_output", context.loop_properties.scan_outputs[0])
+        nodes_to_subgraph.append(time_output_node)
+        context.loop_properties.scan_outputs[0] = time_output_node.output[0]
 
-        time_input_node = self._create_squeeze_node("time_var_input", var.switch_true_identity_output_id)
-        nodes_to_append.append(time_input_node)
+        time_input_node = self._create_squeeze_node(g, "time_var_input", var.switch_true_identity_output_id)
+        nodes_to_subgraph.append(time_input_node)
+
         self.g.replace_all_inputs(self.g.get_nodes(), var.switch_true_identity_output_id, time_input_node.output[0])
         self.g.set_shape(var.switch_true_identity_output_id, [1] + self.g.get_shape(var.switch_true_identity_output_id))
 
-        return var, nodes_to_append
+        return nodes_to_append
 
-    def _create_unsqueeze_node(self, target_name, input_id):
-        input_shape = self.g.get_shape(input_id)
+    def _create_unsqueeze_node(self, g, target_name, input_id):
+        input_shape = g.get_shape(input_id)
         utils.make_sure(input_shape is not None, input_id + "'s shape is none")
         output_shape = [1] + input_shape
-        unsqueeze_node = self.g.make_node("Unsqueeze", [input_id], attr={"axes": [0]},
-                                          shapes=[output_shape], dtypes=[self.g.get_dtype(input_id)],
+        unsqueeze_node = g.make_node("Unsqueeze", [input_id], attr={"axes": [0]},
+                                          shapes=[output_shape], dtypes=[g.get_dtype(input_id)],
                                           op_name_scope=target_name)
 
         return unsqueeze_node
 
-    def _create_squeeze_node(self, target_name, input_id):
-        input_shape = self.g.get_shape(input_id)
+    def _create_squeeze_node(self, g, target_name, input_id):
+        input_shape = g.get_shape(input_id)
         utils.make_sure(input_shape is not None, input_id + "'s shape is none")
         output_shape = list(input_shape)[1:]
-        squeeze_node = self.g.make_node("Squeeze", [input_id], attr={"axes": [0]},
-                                        shapes=[output_shape], dtypes=[self.g.get_dtype(input_id)],
+        squeeze_node = g.make_node("Squeeze", [input_id], attr={"axes": [0]},
+                                        shapes=[output_shape], dtypes=[g.get_dtype(input_id)],
                                         op_name_scope=target_name)
 
         return squeeze_node
     # end of time var workaround
-
+    '''
 
 class CustomRnnLateRewriter(object):
     def __init__(self, g):

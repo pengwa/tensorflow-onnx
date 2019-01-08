@@ -57,7 +57,7 @@ def infer_shape_for_node(g, node):
         log.debug("node %s has inputs don't have shape specified, they are: %s", node.name, no_shape)
         return False
 
-    if node.type in ["Cast", "Enter", "Floor", "ReverseSequence", "Sigmoid", "Tanh", "Identity"]:
+    if node.type in ["Cast", "Enter", "Exit", "Floor", "ReverseSequence", "Sigmoid", "Tanh", "Identity"]:
         return set_shape_from_input(g, node.input[0], node.output[0])
 
     if node.type in ["Add", "GreaterEqual", "Less", "LogicalAnd", "Mul", "RealDiv", "Sub"]:
@@ -127,6 +127,22 @@ def infer_output_shapes_with_partial_inputs(g, node):
             log.debug("set [%s] with new shape %s", node.output[0], new_shape)
             return True
         return False
+    if node.type == "TensorArrayGatherV3":
+        shape = g.get_shape(node.input[2])
+        if shape is not None:
+            new_shape = [-1] + shape
+            g.set_shape(node.output[0], new_shape)
+            log.debug("set [%s] with new shape %s", node.output[0], new_shape)
+            return True
+        return False
+    if node.type == "TensorArrayReadV3":
+        new_shape = g.get_shape(node.input[2])
+        if new_shape is not None:
+            g.set_shape(node.output[0], new_shape)
+            log.debug("set [%s] with new shape %s", node.output[0], new_shape)
+            return True
+        return False
+
     return None
 
 

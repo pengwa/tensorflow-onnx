@@ -149,6 +149,7 @@ class Tf2OnnxBackendTestBase(unittest.TestCase):
             actual = self._run_backend(g, output_names_with_port, onnx_feed_dict)
 
         for expected_val, actual_val in zip(expected, actual):
+            #print(expected_val, actual_val)
             if check_value:
                 self.assertAllClose(expected_val, actual_val, rtol=rtol, atol=0.)
             if check_dtype:

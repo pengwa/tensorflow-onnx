@@ -64,7 +64,7 @@ def tflist_to_onnx(node_list, shape_override):
     ignored_attr = ["unknown_rank", "_class", "Tshape", "use_cudnn_on_gpu", "Index", "Tpaddings",
                     "TI", "Tparams", "Tindices", "Tlen", "Tdim", "dynamic_size", "Tmultiples",
                     "output_dtype", "Tblock_shape", "Tcrops", "index_type", "Taxis", "U", "maxval",
-                    "Tout", "Tlabels"]
+                    "Tout", "Tlabels", "element_shape"]
     # some stats
     op_cnt = collections.Counter()
     attr_cnt = collections.Counter()
@@ -118,17 +118,6 @@ def tflist_to_onnx(node_list, shape_override):
                 attr["to"] = utils.map_tf_dtype(utils.get_tf_node_attr(node, "DstT"))
             elif a == "SrcT":
                 continue
-            elif a == "element_shape":
-                if is_tensor_array_op(node):
-                    # this is for getting output shape for tensor array
-                    shape = node.get_attr("element_shape")
-                    dims = [d.size for d in shape.dim]
-                    output_name = node.outputs[0].name
-                    # override tf's ta output shape, which is [2], not reflecting
-                    # the shape stored in it at all.
-                    output_shapes[output_name] = dims
-                else:
-                    continue
             elif a in ignored_attr:
                 continue
             else:
@@ -1888,6 +1877,7 @@ _OPSET_7 = {
     # workaround created ONNX node in pre-rewriters
     "If": (direct_op, []),
     "Loop": (direct_op, []),
+    "Scan": (direct_op, []),
 }
 
 _OPSET_8 = {
@@ -2299,7 +2289,7 @@ def tensorflow_onnx_mapping(g, continue_on_error, custom_op_handlers):
     onnx_nodes = []
     for node in ops:
         if node.need_skip():
-            log.debug("explictly skip node " + node.name)
+            log.info("explictly skip node " + node.name)
             onnx_nodes.append(node)
             continue
         op = node.type
@@ -2321,11 +2311,12 @@ def tensorflow_onnx_mapping(g, continue_on_error, custom_op_handlers):
             body_graphs = node.get_body_graphs()
             # we assume only ONNX nodes have subgraph defined in pre-rewriters.
             for attr, b_g in body_graphs.items():
-                print(">>>>>>>>", node.name, attr)
                 b_g.topological_sort(b_g.get_nodes())
                 m_ops, unm_ops = tensorflow_onnx_mapping(b_g, continue_on_error, custom_op_handlers)
+                #print(node.name, ">>>>>>>>>>>", b_g.get_nodes())
                 mapped_op += m_ops
                 unmapped_op += unm_ops
+
             onnx_node = func(g, node, node.name, args)
         except Exception as ex:
             type_, value_, traceback_ = sys.exc_info()
@@ -2433,8 +2424,6 @@ def process_tf_graph(tf_graph, continue_on_error=False, verbose=False, target=No
     g = Graph(onnx_nodes, output_shapes, dtypes, target, opset, extra_opset, output_names)
 
     infer_shape_for_graph(g)
-    print(g._output_shapes)
-
     if inputs_as_nchw:
         transpose_inputs(g, inputs_as_nchw)
 
@@ -2445,8 +2434,8 @@ def process_tf_graph(tf_graph, continue_on_error=False, verbose=False, target=No
                  rewrite_random_normal, rewrite_dropout,
                  rewrite_single_direction_lstm, rewrite_bi_direction_lstm,
                  rewrite_single_direction_gru, rewrite_single_direction_grublock,
-                 rewrite_bi_direction_gru, rewrite_custom_rnn_cell,
-                 rewrite_logical_compare_with_equal,
+                 rewrite_bi_direction_gru, 
+                 rewrite_logical_compare_with_equal, rewrite_custom_rnn_cell,
                  rewrite_generic_loop
                  ]
 
@@ -2474,7 +2463,7 @@ def process_tf_graph(tf_graph, continue_on_error=False, verbose=False, target=No
     mapped_op, unmapped_op = tensorflow_onnx_mapping(g, continue_on_error, custom_op_handlers)
 
     # post-processing rewriters
-    late_rewriters = [rewrite_custom_rnn_body_graph, 
+    late_rewriters = [#rewrite_custom_rnn_body_graph, 
                       #rewrite_generic_loop_body_graph
                       ]
     if TARGET_RS5 in target:
@@ -2492,11 +2481,11 @@ def process_tf_graph(tf_graph, continue_on_error=False, verbose=False, target=No
     topological_sort(g.get_nodes())
 
     g.update_proto()
-
+    '''
     if verbose:
         print("tensorflow ops: {}".format(op_cnt))
         print("tensorflow attr: {}".format(attr_cnt))
         print("onnx mapped: {}".format(mapped_op))
         print("onnx unmapped: {}".format(unmapped_op))
-
+    '''
     return g

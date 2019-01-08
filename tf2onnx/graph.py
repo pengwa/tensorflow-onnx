@@ -122,7 +122,7 @@ class Node(object):
         return str(self._op)
 
     def __repr__(self):
-        return "<onnx op type='%s' name=%s>" % (self.type, self._op.name)
+        return "<onnx op type='%s' name=%s, inputs=%s, outputs=%s>" % (self.type, self._op.name, self._input, self._output)
 
     def get_attr(self, name, default=None):
         """Get attribute map."""
@@ -139,10 +139,12 @@ class Node(object):
         return attr
 
     def get_body_graphs(self):
-        return self._body_graphs_by_attr_name
+        return self.graph.child_graphs.get(self.name, {})
 
     def set_body_graph_as_attr(self, attr_name, graph):
-        self._body_graphs_by_attr_name[attr_name] = graph
+        if self.name not in self.graph.child_graphs:
+            self.graph.child_graphs[self.name] = {}
+        self.graph.child_graphs[self.name].update({attr_name: graph})
         graph.parent_g = self.graph
 
     def set_attr(self, name, value):
@@ -263,14 +265,7 @@ class Node(object):
 
         # update attributes to proto
         del self._op.attribute[:]
-        body_graphs = self.get_body_graphs()
-        for attr_name, b_g in body_graphs.items():
-            graph_proto = b_g.make_graph("graph doc of " + attr_name, attr_name + " of node " + self.name)
-            g_attr = helper.make_attribute(attr_name, graph_proto)
-            self.set_attr_onnx(g_attr)
-        attr = [a for a in self.attr_onnx.values()]
-        if attr:
-            self._op.attribute.extend(attr)
+        self._op.attribute.extend(self.attr_onnx.values())
 
     def get_implicit_inputs(self):
         """Get implicit inputs if the node has attributes being GraphProto."""
@@ -304,6 +299,7 @@ class Node(object):
         return outer_scope_node_input_ids
 
 
+
 class Graph(object):
     """"Class that provides graph manipulation and matching."""
 
@@ -333,6 +329,7 @@ class Graph(object):
         self._extra_opset = extra_opset
         self.output_names = output_names
         self.parent_g = None
+        self.child_graphs = {}
         ops = [Node(node, self) for node in nodes]
 
         # add identity node after each output, in case it is renamed during conversion.
@@ -627,8 +624,21 @@ class Graph(object):
             optimize: optimize graph via onnx
             doc: text for doc string of the model
         """
+        #print("=============================================")
+        #print("Before deleting unused nodes with output names", self.output_names, self.get_nodes())
         self.delete_unused_nodes(self.output_names)
         self.topological_sort(self.get_nodes())
+        #print("\r\n\r\nAfter deleting unused nodes", self.get_nodes())
+        for node_name, attr_graphs in self.child_graphs.items():
+            print("\t" + node_name)
+            body_graph_owner = self.get_node_by_name(node_name)
+            for attr_name, sub_graph in attr_graphs.items():
+                print("\t\t" + attr_name)
+                print("\t\t", body_graph_owner.name)
+                graph_proto = sub_graph.make_graph("graph for " + node_name + " " + attr_name)
+                #print("\t\t", body_graph_owner, "END")
+                body_graph_owner.set_attr(attr_name, graph_proto)
+
         # update attributes
         self.update_proto()
 
@@ -643,9 +653,10 @@ class Graph(object):
         output_tensor_values = []
         for name in self.output_names:
             dtype = self.get_dtype(name)
-            if not dtype:
-                raise ValueError("cannot found the output dtype for " + name)
-            v = utils.make_onnx_inputs_outputs(name, dtype, self.get_shape(name))
+            shape = self.get_shape(name)
+            utils.make_sure(dtype, "output dtype for " + name + " is invalid")
+            utils.make_sure(shape is not None, "cannot found the output shape for " + name)
+            v = utils.make_onnx_inputs_outputs(name, dtype, shape)
             output_tensor_values.append(v)
 
         ops = []
@@ -677,7 +688,7 @@ class Graph(object):
                                   output_tensor_values,
                                   initializer=initializers,
                                   doc_string=doc)
-
+        print("make_graph complete : " + doc)
         return graph
 
     def make_model(self, doc, optimize=False, graph_name="tf2onnx"):
@@ -870,7 +881,8 @@ class Graph(object):
                     else:
                         implicit_input = self.get_node_by_output_recursively(input_id)
                         if not implicit_input:
-                            print("WARINING: node " + top_node.name + "'s input ["+ input_id +"] not exist in output map")
+                            pass
+                            #print("WARINING: node " + top_node.name + "'s input ["+ input_id +"] not exist in output map")
                         # node is allowed to None for few reasons:
                         # 1). some node (for example Scan) has optional inputs, which might has empty input.
                         # 2). subgraph might has input defined in outer graph
@@ -909,6 +921,5 @@ class Graph(object):
 
     def delete_unused_nodes(self, output_names):
         """Delete nodes not in subgraph ending with output_names."""
-        print("delete_unused_nodes: ", output_names)
         related_nodes = self.extract_sub_graph_nodes(output_names)
         self.set_nodes(related_nodes)

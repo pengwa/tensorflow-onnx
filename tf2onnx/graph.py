@@ -35,6 +35,8 @@ class Node(object):
         """
         self._op = node
         self.graph = graph
+        self.dtypes = {}
+        self.shapes = {}
         self._input = [i for i in node.input]
         self._output = [i for i in node.output]
         self._attr = {}
@@ -44,13 +46,7 @@ class Node(object):
         # dict to original attributes
         for a in node.attribute:
             self._attr[a.name] = a
-        # try to find a dtype for this node
-        dtype = graph.get_dtype(node.name)
-        if not dtype:
-            dtype = self._attr.get("dtype")
-            if dtype:
-                dtype = dtype.i
-        self._dtype = dtype
+
         self.data_format = self.get_attr("data_format")
         if self.data_format:
             self.data_format = self.data_format.s.decode("utf-8")
@@ -161,14 +157,14 @@ class Node(object):
 
     @property
     def output_shapes(self):
-        """Get output shapes."""
-        val = [self.graph.get_shape(n) for n in self._output]
+        """Get output shapes in output order."""
+        val = [self.shapes[n] for n in self._output]
         return val
 
     @property
     def output_dtypes(self):
-        """Get output dtypes."""
-        val = [self.graph.get_dtype(n) for n in self._output]
+        """Get output dtypes in output order."""
+        val = [self.dtypes[n] for n in self._output]
         return val
 
     def get_tensor_type(self):
@@ -235,18 +231,8 @@ class Node(object):
         t.raw_data = new_val.tobytes()
         for i, _ in enumerate(t.dims):
             t.dims[i] = new_val.shape[i]
-        # track shapes in _output_shapes
-        self.graph.set_shape(t.name, t.dims)
 
-    @property
-    def dtype(self):
-        """Return dtype."""
-        return self._dtype
-
-    @dtype.setter
-    def dtype(self, val):
-        """Set dtype."""
-        self._dtype = val
+        self.shapes[t.name] = t.dims
 
     def get_body_graphs(self):
         return self.graph.contained_graphs.get(self.name, None)
@@ -346,12 +332,8 @@ class Graph(object):
         self._initializers = {}
         self._nodes_by_name = {}
         self._output_to_node_name = {}
-        self.shapes = {}
 
         self._target = set(target)
-        self._dtypes = dtypes
-
-        self._output_shapes = output_shapes
         self._opset = find_opset(opset)
         self._extra_opset = extra_opset
 
@@ -361,7 +343,12 @@ class Graph(object):
         self.parent_graph = None
         self.contained_graphs = {}  # {node_name: {node_attribute_name: Graph}}
 
-        ops = [Node(node, self) for node in nodes]
+        ops = []
+        for node in nodes:
+            n = Node(node, self)
+            n.dtypes = {o: dtypes[o] for o in node.output}
+            n.shapes = {o: output_shapes[o] for o in node.output}
+            ops.append(n)
 
         # add identity node after each output, in case it is renamed during conversion.
         if self.outputs:
@@ -382,10 +369,10 @@ class Graph(object):
                                                          op_name_scope="graph_outputs")
                         to_append.append(new_output_node)
 
+                        # must update node name mapping in case shape/dtype cannot be retrieved correctly
+                        self.set_node_by_name(n)
                         self.copy_shape(o, new_out)
                         self.set_dtype(new_out, self.get_dtype(o))
-
-                self.set_node_by_name(n)
             ops.extend(to_append)
 
         self.set_nodes(ops)
@@ -605,11 +592,15 @@ class Graph(object):
 
     def get_dtype(self, name):
         """Get dtype for node."""
-        return self._dtypes.get(name)
+        # todo(pengwa): enable recursive search along with loop change.
+        owner_node = self.get_node_by_output(name, search_in_parent_graphs=False)
+        return owner_node.dtypes.get(name)
 
     def set_dtype(self, name, dtype):
         """Set dtype for node."""
-        self._dtypes[name] = dtype
+        # todo(pengwa): enable recursive search along with loop change.
+        owner_node = self.get_node_by_output(name, search_in_parent_graphs=False)
+        owner_node.dtypes[name] = dtype
 
     def copy_dtype(self, src_name, dst_name):
         """Copy dtype from another node."""
@@ -618,8 +609,10 @@ class Graph(object):
 
     def get_shape(self, name):
         """Get shape for node."""
+        # todo(pengwa): enable recursive search along with loop change.
+        owner_node = self.get_node_by_output(name, search_in_parent_graphs=False)
         assert isinstance(name, six.text_type)
-        shape = self._output_shapes.get(name)
+        shape = owner_node.shapes.get(name)
         if shape:
             for i, v in enumerate(shape):
                 if v is None:
@@ -634,7 +627,9 @@ class Graph(object):
         """Set new shape of node."""
         if isinstance(val, np.ndarray):
             val = val.tolist()
-        self._output_shapes[name] = val
+        # todo(pengwa): enable recursive search along with loop change.
+        owner_node = self.get_node_by_output(name, search_in_parent_graphs=False)
+        owner_node.shapes[name] = val
 
     def copy_shape(self, input_name, output_name):
         """Copy shape from another node."""

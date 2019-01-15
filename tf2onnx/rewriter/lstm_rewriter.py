@@ -73,7 +73,7 @@ class LSTMUnitRewriter(UnitRewriterBase):
         if not ft:
             return None
 
-        if not (len(ft.value) == 1 and b_e.dtype == ft_bias.dtype):
+        if not (len(ft.value) == 1 and b_e.output_dtypes[0] == ft_bias.output_dtypes[0]):
             return None
 
         return RnnWeights(w, b, ft)

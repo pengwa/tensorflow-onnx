@@ -291,7 +291,7 @@ def reduce_op(ctx, node, name, args):
 
 def placeholder_op(ctx, node, name, args):
     input_name = node.output[0]
-    ctx.add_graph_input(input_name, node.dtype, ctx.get_shape(input_name))
+    ctx.add_graph_input(input_name, node.output_dtypes[0], ctx.get_shape(input_name))
     return None
 
 
@@ -339,7 +339,7 @@ def reshape_op(ctx, node, name, args):
 
 
 def reshape_op5(ctx, node, name, args):
-    need_casting = node.dtype in [onnx_pb.TensorProto.INT32,
+    need_casting = node.output_dtypes[0] in [onnx_pb.TensorProto.INT32,
                                   onnx_pb.TensorProto.INT16,
                                   onnx_pb.TensorProto.INT64]
     # onnx wants reshape.input[1] to have the value be int64 which is not the case for tensorflow.
@@ -358,8 +358,8 @@ def reshape_op5(ctx, node, name, args):
     if len(next_nodes) != 1 or next_nodes[0].type != "Cast":
         op_name = utils.make_name(node.name)
         output_cast = ctx.insert_new_node_on_output("Cast", node.output[0], name=op_name)
-        output_cast.set_attr("to", node.dtype)
-        ctx.set_dtype(output_cast.output[0], node.dtype)
+        output_cast.set_attr("to", node.output_dtypes[0])
+        ctx.set_dtype(output_cast.output[0], node.output_dtypes[0])
         ctx.copy_shape(node.output[0], output_cast.output[0])
         nodes.append(output_cast)
     return [input_cast] + nodes
@@ -769,10 +769,10 @@ def sign_op(ctx, node, name, args):
     """Sign op."""
     # T sign = Sign(T Input)
     nodes = []
-    node_dtype = node.dtype
+    node_dtype = node.output_dtypes[0]
     utils.make_sure(node_dtype, "Dtype of {} is None".format(node.name))
     if node_dtype in [onnx_pb.TensorProto.COMPLEX64, onnx_pb.TensorProto.COMPLEX128]:
-        raise ValueError("dtype " + node.dtype + " is not supported in onnx for now")
+        raise ValueError("dtype " + node.output_dtypes[0] + " is not supported in onnx for now")
     input_tensor_type = utils.ONNX_TO_NUMPY_DTYPE[node_dtype]
     zero_name = utils.make_name("{}_zero".format(node.name))
     ctx.make_const(zero_name, np.array(0, dtype=input_tensor_type))
@@ -841,7 +841,7 @@ def transpose_op(ctx, node, name, args):
 def _wrap_concat_with_cast(ctx, node):
     """wrap concat in casts for opset < 8 since it only supports."""
     supported_types = [onnx_pb.TensorProto.FLOAT, onnx_pb.TensorProto.FLOAT16]
-    dtype = node.dtype
+    dtype = node.output_dtypes[0]
     need_casting = dtype not in supported_types
     nodes = []
     if need_casting:
@@ -859,7 +859,6 @@ def _wrap_concat_with_cast(ctx, node):
             op_name = utils.make_name(node.name)
             output_cast = ctx.insert_new_node_on_output("Cast", output_name, name=op_name)
             output_cast.set_attr("to", dtype)
-            output_cast.dtype = dtype
             ctx.set_dtype(output_cast.output[0], dtype)
             ctx.copy_shape(output_name, output_cast.output[0])
             nodes.append(output_cast)
@@ -1371,8 +1370,8 @@ def matmul_op(ctx, node, name, args):
 
     if any(attrs_val[2:]):
         # conjugation operation on complex data not supported in onnx for now, so if it's complex than raise exception
-        if node.dtype not in [onnx_pb.TensorProto.FLOAT, onnx_pb.TensorProto.FLOAT16, onnx_pb.TensorProto.DOUBLE]:
-            raise ValueError("dtype " + node.dtype + " is not supported in onnx matmul for now")
+        if node.output_dtypes[0] not in [onnx_pb.TensorProto.FLOAT, onnx_pb.TensorProto.FLOAT16, onnx_pb.TensorProto.DOUBLE]:
+            raise ValueError("dtype " + node.output_dtypes[0] + " is not supported in onnx matmul for now")
 
     transpose_a = (attrs_val[0] + attrs_val[2] + attrs_val[4]) % 2
     transpose_b = (attrs_val[1] + attrs_val[3] + attrs_val[5]) % 2
@@ -2396,6 +2395,7 @@ def process_tf_graph(tf_graph, continue_on_error=False, verbose=False, target=No
     g = Graph(onnx_nodes, output_shapes, dtypes, target, opset, extra_opset, output_names)
 
     infer_shape_for_graph(g)
+    
 
     if inputs_as_nchw:
         transpose_inputs(g, inputs_as_nchw)

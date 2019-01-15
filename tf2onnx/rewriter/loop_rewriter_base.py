@@ -184,7 +184,8 @@ class LoopRewriterBase:
 
         self.g.set_shape(loop_var.next_iteration_input_id, var_output_shape)
         self.g.set_shape(loop_var.switch_true_identity_output_id, var_output_shape)
-        self.g.set_shape(loop_var.exit_output_id, var_output_shape)
+        if loop_var.exit_output_id:
+            self.g.set_shape(loop_var.exit_output_id, var_output_shape)
         log.debug("_tune_shape_for_loop_var new shape is %s", var_output_shape)
 
         return loop_var

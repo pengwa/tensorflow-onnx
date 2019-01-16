@@ -283,49 +283,33 @@ class Node(object):
         if attr:
             self._op.attribute.extend(attr)
 
-    def get_implicit_inputs(self, require_input_in_cur_graph=False):
+    def get_implicit_inputs(self, recursive=True):
         """Get implicit inputs if the node has attributes being GraphProto."""
-        body_graphs = [a.g for a in self.attr_onnx.values() if a.HasField('g')]
-        outer_scope_node_input_ids = set()
-        for sub_g in body_graphs:
-            outer_scope_node_input_ids |= self._get_implicit_inputs(sub_g)
+        output_available_in_cur_graph = set()
+        all_node_inputs = set()
 
-        if require_input_in_cur_graph:
-            # only find referenced node in current graph
-            implicit_inputs_in_current_graph = set()
-            for input_id in outer_scope_node_input_ids:
-                n = self.graph.get_node_by_output(input_id)
-                if n is None:
-                    if not self.graph.is_initializer(input_id):
-                        if input_id not in self.graph.inputs:
-                            continue
-                implicit_inputs_in_current_graph.add(input_id)
-            return implicit_inputs_in_current_graph
-        return outer_scope_node_input_ids
+        graphs = []
+        body_graphs = self.get_body_graphs()
+        if body_graphs:
+            graphs.extend(body_graphs.values())
 
-    @staticmethod
-    def _get_implicit_inputs(onnx_graph, recursive=True):
-        """Get implicit inputs for specified onnx graph."""
-        node_map = set()
-        for n in onnx_graph.node:
-            node_map |= set(n.output)
+        while graphs:
+            graph = graphs.pop()
+            for n in graph.get_nodes():
+                output_available_in_cur_graph |= set(n.output)
+                for i in n.input:
+                    all_node_inputs.add(i)
 
-        for n in onnx_graph.input:
-            node_map.add(n.name)
+                if recursive:
+                    b_graphs = n.get_body_graphs()
+                    if b_graphs:
+                        graphs.extend(b_graphs.values())
 
-        outer_scope_node_input_ids = set()
-        for n in onnx_graph.node:
-            for i in n.input:
-                if i not in node_map:
-                    outer_scope_node_input_ids.add(i)
+            # exclude graph inputs
+            for n in graph.inputs:
+                output_available_in_cur_graph.add(n)
 
-        if recursive:
-            for n in onnx_graph.node:
-                for attr in n.attribute:
-                    sub_g = attr.g
-                    if sub_g:
-                        outer_scope_node_input_ids |= Node._get_implicit_inputs(sub_g)
-
+        outer_scope_node_input_ids = all_node_inputs - output_available_in_cur_graph
         return outer_scope_node_input_ids
 
 
@@ -445,6 +429,11 @@ class Graph(object):
             else:
                 raw_attr[a] = v
         onnx_node = helper.make_node(op_type, inputs, outputs, name=name, **raw_attr)
+
+        if op_type in ["If", "Loop", "Scan"]:
+            # we force the op containing inner graphs not skipped during conversion.
+            skip_conversion = False
+
         node = Node(onnx_node, self, skip_conversion=skip_conversion)
         if onnx_attrs:
             _ = [node.set_attr_onnx(a) for a in onnx_attrs]
@@ -479,7 +468,7 @@ class Graph(object):
         """Get node list."""
         return self._nodes
 
-    def get_node_by_output(self, output, search_in_parent_graphs=False):
+    def get_node_by_output(self, output, search_in_parent_graphs=True):
         """Get node by node output id recursively going through nested graphs.
         Args:
             search_in_parent_graphs: search in all parent graphs
@@ -605,11 +594,27 @@ class Graph(object):
 
     def get_dtype(self, name):
         """Get dtype for node."""
-        return self._dtypes.get(name)
+        # todo(pengwa): we should use Node to get dtype, then we don't need
+        # handle the recursive search for it.
+        ret = None
+        g = self
+        while ret is None and g:
+            ret = g._dtypes.get(name)
+            if ret is not None:
+                return ret
+            g = g.parent_graph
+        return ret
 
     def set_dtype(self, name, dtype):
         """Set dtype for node."""
-        self._dtypes[name] = dtype
+        ret = None
+        g = self
+        while ret is None and g:
+            if name in g._dtypes:
+                g._dtypes[name] = dtype
+                return
+            g = g.parent_graph
+        raise ValueError("dtype not found for " + name)
 
     def copy_dtype(self, src_name, dst_name):
         """Copy dtype from another node."""
@@ -618,23 +623,37 @@ class Graph(object):
 
     def get_shape(self, name):
         """Get shape for node."""
+        # todo(pengwa): we should use Node to get shape, then we don't need
+        # handle the recursive search for it.
         assert isinstance(name, six.text_type)
-        shape = self._output_shapes.get(name)
-        if shape:
-            for i, v in enumerate(shape):
-                if v is None:
-                    shape[i] = -1
-            # hack to allow utils.ONNX_UNKNOWN_DIMENSION to override batchsize if needed.
-            # default is -1.
-            if shape[0] == -1:
-                shape[0] = utils.ONNX_UNKNOWN_DIMENSION
+        shape = None
+        g = self
+        while shape is None and g:
+            shape = self._output_shapes.get(name)
+            if shape:
+                for i, v in enumerate(shape):
+                    if v is None:
+                        shape[i] = -1
+                # hack to allow utils.ONNX_UNKNOWN_DIMENSION to override batchsize if needed.
+                # default is -1.
+                if shape[0] == -1:
+                    shape[0] = utils.ONNX_UNKNOWN_DIMENSION
+                return shape
+            g = g.parent_graph
         return shape
 
     def set_shape(self, name, val):
         """Set new shape of node."""
         if isinstance(val, np.ndarray):
             val = val.tolist()
-        self._output_shapes[name] = val
+        ret = None
+        g = self
+        while ret is None and g:
+            if name in g._output_shapes:
+                g._output_shapes[name] = val
+                return
+            g = g.parent_graph
+        raise ValueError("output_shape not found for " + name)
 
     def copy_shape(self, input_name, output_name):
         """Copy shape from another node."""
@@ -964,11 +983,14 @@ class Graph(object):
         while processing_set:
             top_node = processing_set.pop()
             res_set.add(top_node)
-            implicit_inputs = [self.get_node_by_output(node_output) for node_output in top_node.get_implicit_inputs()]
-            for node in top_node.inputs + implicit_inputs:
+            all_inputs = top_node.input + list(top_node.get_implicit_inputs())
+            for input_id in all_inputs:
+                # we don't care about nested graph here, just handle current graph cropping.
+                node = self.get_node_by_output(input_id, search_in_parent_graphs=False)
                 if not node:
                     # some node (for example Scan) has optional inputs, which
                     # might has empty input.
+                    # subgraph might has input defined in outer graph
                     continue
                 if node not in res_set:
                     if input_checker and input_checker(node) is False:
@@ -1137,6 +1159,13 @@ class GraphUtil(object):
                 raise ValueError("failed to parse tensor value from Constant node")
 
         GraphUtil._parse_graph_input(g, graph_proto)
+
+        for n in g.get_nodes():
+            for attr_name, attr_val in n.attr.items():
+                if attr_val.HasField('g'):
+                    # it was assumed that the a.g has inferred shapes/dtypes.
+                    sub_g = GraphUtil.create_graph_from_onnx_graph(attr_val.g)
+                    n.set_body_graph_as_attr(attr_name, sub_g)
         return g
 
     @staticmethod

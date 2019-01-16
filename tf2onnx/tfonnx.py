@@ -63,7 +63,7 @@ def tflist_to_onnx(node_list, shape_override):
     ignored_attr = ["unknown_rank", "_class", "Tshape", "use_cudnn_on_gpu", "Index", "Tpaddings",
                     "TI", "Tparams", "Tindices", "Tlen", "Tdim", "dynamic_size", "Tmultiples",
                     "output_dtype", "Tblock_shape", "Tcrops", "index_type", "Taxis", "U", "maxval",
-                    "Tout", "Tlabels", "Tindex"]
+                    "Tout", "Tlabels", "Tindex", "element_shape"]
     # some stats
     op_cnt = collections.Counter()
     attr_cnt = collections.Counter()
@@ -117,17 +117,6 @@ def tflist_to_onnx(node_list, shape_override):
                 attr["to"] = utils.map_tf_dtype(utils.get_tf_node_attr(node, "DstT"))
             elif a == "SrcT":
                 continue
-            elif a == "element_shape":
-                if is_tensor_array_op(node):
-                    # this is for getting output shape for tensor array
-                    shape = node.get_attr("element_shape")
-                    dims = [d.size for d in shape.dim]
-                    output_name = node.outputs[0].name
-                    # override tf's ta output shape, which is [2], not reflecting
-                    # the shape stored in it at all.
-                    output_shapes[output_name] = dims
-                else:
-                    continue
             elif a in ignored_attr:
                 continue
             else:
@@ -187,6 +176,7 @@ def direct_op(ctx, node, name, args):
 
 def identity_op(ctx, node, name, args):
     """Identity."""
+    '''
     if node.inputs[0].is_const():
         # should not remove the identity node if it is output of the graph
         if node.output[0] in ctx.outputs:
@@ -201,6 +191,7 @@ def identity_op(ctx, node, name, args):
         return None
 
     ctx.copy_shape(node.input[0], node.output[0])
+    '''
     return node
 
 
@@ -279,8 +270,10 @@ def arg_minmax_op(ctx, node, name, args):
 
 def reduce_op(ctx, node, name, args):
     axes_node = node.inputs[1]
-    axis = axes_node.get_tensor_value()
-    node.set_attr("axes", axis)
+    axis = axes_node.get_tensor_value()[0]
+    if axis < 0:
+        axis += len(ctx.get_shape(node.input[0]))
+    node.set_attr("axes", [axis])
     ctx.remove_input(node, node.input[1])
     keep_dims = node.get_attr("keep_dims")
     if keep_dims:
@@ -370,7 +363,6 @@ def less_op7(ctx, node, name, args):
     nodes = [node]
     input1_dtype = ctx.get_dtype(node.input[0])
     input2_dtype = ctx.get_dtype(node.input[1])
-    utils.make_sure(input1_dtype == input2_dtype, "less inputs not having same dtype")
     target_dtype = onnx_pb.TensorProto.FLOAT
     need_case_1 = input1_dtype != target_dtype
     if need_case_1:

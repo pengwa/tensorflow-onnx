@@ -147,6 +147,8 @@ def _convert_shapenode_to_int64(ctx, node, input_number):
     """cast int32 shape into int64 shape."""
     shape_node = node.inputs[input_number]
     name = node.input[input_number]
+
+    '''
     if shape_node.is_const():
         # if it is a const, change the const to be int64
         shape = shape_node.get_tensor_value()
@@ -155,6 +157,7 @@ def _convert_shapenode_to_int64(ctx, node, input_number):
         ctx.set_dtype(shape_node.output[0], onnx_pb.TensorProto.INT64)
         ctx.copy_shape(name, shape_node.output[0])
         return [node]
+    '''
 
     cast_node = ctx.insert_new_node_on_input(node, "Cast", name)
     cast_node.set_attr("to", onnx_pb.TensorProto.INT64)
@@ -175,6 +178,7 @@ def direct_op(ctx, node, name, args):
 
 def identity_op(ctx, node, name, args):
     """Identity."""
+    '''
     if node.inputs[0].is_const():
         # should not remove the identity node if it is output of the graph
         if node.output[0] in ctx.outputs:
@@ -186,6 +190,7 @@ def identity_op(ctx, node, name, args):
         return None
 
     ctx.copy_shape(node.input[0], node.output[0])
+    '''
     return node
 
 
@@ -902,7 +907,16 @@ def pad_op(ctx, node, name, args):
     #  or PadV2(T input, int32 paddings, T constant_value, @type Tpaddings), CONST mode - default value specified
     #  or MirrorPad(T input, int32 paddings, @type Tpaddings, @STRING mode), other mode.
     # T output = Pad(T data, @STRING mode, @INTS pads, @FLOAT value)
-    paddings = np.array(node.inputs[1].get_tensor_value()).transpose().flatten()
+    nodes = [node]
+    paddings = None
+    if name in ["parallel_0/transformer_0/add_timing_signal/Pad",
+                "parallel_0/while/transformer_0/add_timing_signal/Pad", # transformer
+                "parallel_0/transformer_0/add_timing_signal_1/Pad", # comment gen second/first
+                ]:
+        paddings = np.array([[0, 0], [0, 0]]).transpose().flatten()
+    else:
+        paddings = np.array(node.inputs[1].get_tensor_value()).transpose().flatten()
+
     mode = node.get_attr("mode")
     if mode:
         mode = mode.s.decode("utf-8").lower()
@@ -917,7 +931,22 @@ def pad_op(ctx, node, name, args):
 
     ctx.remove_input(node, node.input[1])
     node.set_attr("pads", paddings)
-    return node
+
+    origin_dtype = ctx.get_dtype(node.output[0])
+    if origin_dtype not in [onnx_pb.TensorProto.FLOAT16, onnx_pb.TensorProto.FLOAT, onnx_pb.TensorProto.DOUBLE]:
+        cast_node = ctx.insert_new_node_on_input(node, "Cast", node.input[0])
+        cast_node.set_attr("to", onnx_pb.TensorProto.FLOAT)
+        ctx.set_dtype(cast_node.output[0], onnx_pb.TensorProto.FLOAT)
+        ctx.copy_shape(name, cast_node.output[0])
+        nodes.append(cast_node)
+
+        cast_back_node = ctx.insert_new_node_on_output("Cast", node.output[0], name=utils.make_name(node.name) +"_castback")
+        cast_back_node.set_attr("to", origin_dtype)
+        ctx.set_dtype(cast_back_node.output[0], origin_dtype)
+        ctx.copy_shape(name, cast_back_node.output[0])
+        nodes.append(cast_back_node)
+
+    return nodes
 
 
 def rsqrt_op(ctx, node, name, args):
@@ -1224,9 +1253,9 @@ def minmax_op(ctx, node, name, args):
 def pack_op(ctx, node, name, args):
     # in tf, "pack" can accept one input tensor which means doing nothing,
     # so remove the node in ONNX
-    if len(node.inputs) == 1:
-        ctx.replace_all_inputs(ctx.get_nodes(), node.output[0], node.input[0])
-        return None
+    #if len(node.inputs) == 1:
+    #    ctx.replace_all_inputs(ctx.get_nodes(), node.output[0], node.input[0])
+    #    return None
 
     # hack to make up for the missing onnx pack op
     axis = node.get_attr("axis").i
@@ -1387,6 +1416,7 @@ def fill_op7(ctx, node, name, args):
     # T outputs = Tile(T value, int64 repeats (e.g. dims))
     nodes = [node]
     fill_shape = ctx.get_shape(node.input[0])
+    print("fill_op7 shape ", node.input[0], fill_shape)
     fill_shape_dims = fill_shape[0]
     val_dtype = ctx.get_dtype(node.input[1])
     val_shape = ctx.get_shape(node.input[1])
@@ -1650,13 +1680,16 @@ def reduce_logic_op(ctx, node, name, args):
 
     utils.make_sure(all(i >= 0 for i in reduce_dim), "negative reduce axis is not supported in onnx for now")
 
-    cast = ctx.make_node(op_type="Cast", inputs=[node.input[0]], attr={"to": onnx_pb.TensorProto.INT32})
+    cast = ctx.make_node(op_type="Cast", inputs=[node.input[0]], attr={"to": onnx_pb.TensorProto.FLOAT})
     keepdims = helper.get_attribute_value(node.get_attr("keep_dims"))
     op_type = "ReduceMin" if node.type == "All" else "ReduceSum"
     reduce_node = ctx.make_node(op_type=op_type, inputs=cast.output, attr={"axes": reduce_dim, "keepdims": keepdims})
-    res = ctx.make_node(op_type="Cast", inputs=reduce_node.output, attr={"to": onnx_pb.TensorProto.BOOL},
+
+    zero_node = ctx.make_const(utils.make_name("zero_reduce"), np.array(0, dtype=np.float32))
+
+    res = ctx.make_node(op_type="Greater", inputs=[reduce_node.output[0], zero_node.output[0]],
                         name=node.name, outputs=node.output)
-    return [cast, reduce_node, res]
+    return [cast, reduce_node, zero_node, res]
 
 
 def zeroslike_op(ctx, node, name, args):
@@ -2252,7 +2285,8 @@ def rewrite_incomplete_type_support_rs5(g, ops):
 
 
 def rewrite_incomplete_type_support_rs6(g, ops):
-    return rewrite_incomplete_type_support(g, ops, ["Div", "ReduceSum", "Slice", "Split", "Tile", "Transpose"])
+    # MAX should be be here since it only support float and double in the spec, put it here just for workaround
+    return rewrite_incomplete_type_support(g, ops, ["Div", "Max", "ReduceSum", "Slice", "Split", "Tile", "Transpose"])
 
 
 def tensorflow_onnx_mapping(g, continue_on_error, custom_op_handlers):
@@ -2443,6 +2477,7 @@ def process_tf_graph(tf_graph, continue_on_error=False, verbose=False, target=No
     g = Graph(onnx_nodes, output_shapes, dtypes, target, opset, extra_opset, output_names)
 
     infer_shape_for_graph(g)
+    print(g._output_shapes)
 
     if inputs_as_nchw:
         transpose_inputs(g, inputs_as_nchw)

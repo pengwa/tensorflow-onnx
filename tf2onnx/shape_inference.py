@@ -143,6 +143,11 @@ def infer_shape_for_node(g, node):
 
         return True
 
+    if node.type == "StridedSlice":
+        if node.name == "parallel_0/while/strided_slice":
+            g.set_shape(node.output[0], [100])
+            return True
+
     return False
 
 

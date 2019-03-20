@@ -1833,6 +1833,7 @@ _OPSET_9 = {
     "ResizeBilinear": (upsample_op9, ["Upsample", "linear"]),
     "ResizeNearestNeighbor": (upsample_op9, ["Upsample", "nearest"]),
     "ReverseSequence": (reverse_op9, []),
+    "Select": (direct_op, ["Where"]),
     "Sign": (sign_op9, []),
     "Sinh": (direct_op, []),
     "Where": (where_op, []),
